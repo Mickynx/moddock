@@ -7,16 +7,21 @@ main.py starts/stops it from the panel toggle.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 import secrets
 import socket
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Awaitable, Callable
 
 from aiohttp import web
 
 ALLOWED_UPLOAD_EXTS = {".zip", ".7z", ".rar", ".pak", ".utoc", ".ucas"}
 MAX_FILE_SIZE = 2 * 1024**3  # 2 GiB per file
+# Well under the 255-byte per-component limit of ext4/btrfs, leaving room for
+# the " (n)" collision suffix and the ".part" staging suffix.
+MAX_FILENAME_LEN = 200
 
 _FILENAME_RE = re.compile(r"[^A-Za-z0-9 ._()\[\]-]+")
 
@@ -55,13 +60,25 @@ async function up(){
 
 
 def sanitize_filename(name: str) -> str | None:
-    base = PureWindowsPath(name.replace("\\", "/")).name
+    normalized = name.replace("\\", "/")
+    # Refuse anything that tried to walk out of the inbox, even though the
+    # basename extraction below would already neutralise it.
+    if ".." in PurePosixPath(normalized).parts:
+        return None
+    base = PureWindowsPath(normalized).name
     base = Path(base).name
     base = _FILENAME_RE.sub("", base).strip()
     if not base or base.startswith("."):
         return None
-    if Path(base).suffix.lower() not in ALLOWED_UPLOAD_EXTS:
+    suffix = Path(base).suffix
+    if suffix.lower() not in ALLOWED_UPLOAD_EXTS:
         return None
+    if len(base) > MAX_FILENAME_LEN:
+        # Clamp rather than reject: the filesystem would raise ENAMETOOLONG.
+        stem = Path(base).stem[: MAX_FILENAME_LEN - len(suffix)].strip()
+        if not stem or stem.startswith("."):
+            return None
+        base = stem + suffix
     return base
 
 
@@ -86,6 +103,12 @@ def qr_svg(text: str) -> str:
     return buffer.getvalue().decode("utf-8")
 
 
+def _discard(path: Path) -> None:
+    """Remove a staging file, ignoring anything the filesystem complains about."""
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
+
+
 def _unique_path(directory: Path, name: str) -> Path:
     candidate = directory / name
     stem, suffix = Path(name).stem, Path(name).suffix
@@ -102,10 +125,12 @@ class UploadServer:
         inbox: Path,
         port: int,
         on_upload: Callable[[str], Awaitable[None]] | None = None,
+        host: str = "0.0.0.0",
     ):
         self.inbox = inbox
         self.port = port
         self.on_upload = on_upload
+        self.host = host
         self.token: str | None = None
         self._runner: web.AppRunner | None = None
 
@@ -139,36 +164,71 @@ class UploadServer:
                 rejected.append(f"{raw_name or '(unnamed)'}: file type not allowed")
                 continue
             target = _unique_path(self.inbox, name)
-            size = 0
-            with target.open("wb") as fh:
-                while chunk := await part.read_chunk(1024 * 256):
-                    size += len(chunk)
-                    if size > MAX_FILE_SIZE:
-                        fh.close()
-                        target.unlink(missing_ok=True)
-                        rejected.append(f"{name}: exceeds size limit")
-                        break
-                    fh.write(chunk)
-                else:
-                    saved.append(target.name)
-                    if self.on_upload is not None:
-                        await self.on_upload(target.name)
+            # Stream to a staging name and rename on success, so a truncated
+            # transfer never shows up in the inbox under its final name.
+            temp = _unique_path(self.inbox, f"{target.name}.part")
+            try:
+                size = 0
+                too_large = False
+                with temp.open("wb") as fh:
+                    while chunk := await part.read_chunk(1024 * 256):
+                        size += len(chunk)
+                        if size > MAX_FILE_SIZE:
+                            too_large = True
+                            break
+                        fh.write(chunk)
+                if too_large:
+                    _discard(temp)
+                    rejected.append(f"{name}: exceeds size limit")
+                    continue
+                os.replace(temp, target)
+            except OSError as exc:
+                # One unwritable file must not fail the whole upload.
+                _discard(temp)
+                rejected.append(f"{name}: could not be saved ({exc.strerror or exc})")
+                continue
+            except BaseException:
+                # Client disconnect or cancellation: leave nothing behind.
+                _discard(temp)
+                raise
+            saved.append(target.name)
+            if self.on_upload is not None:
+                try:
+                    await self.on_upload(target.name)
+                except Exception:
+                    # The file is already safely on disk; a failing hook must
+                    # not turn a successful upload into a 500. No decky logger
+                    # is available in this module, so the error is swallowed.
+                    pass
         return web.json_response({"saved": saved, "rejected": rejected})
 
     async def start(self) -> None:
         if self._runner is not None:
             return
-        self.token = secrets.token_urlsafe(8)
-        self._runner = web.AppRunner(self.build_app())
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, "0.0.0.0", self.port)
-        await site.start()
+        token = secrets.token_urlsafe(8)
+        runner = web.AppRunner(self.build_app())
+        try:
+            await runner.setup()
+            site = web.TCPSite(runner, self.host, self.port)
+            await site.start()
+        except BaseException:
+            # A failed bind (port in use) must not leave a half-started
+            # server: status() would advertise a URL for a dead socket and
+            # every later start() would early-return on a stale runner.
+            with contextlib.suppress(Exception):
+                await runner.cleanup()
+            raise
+        # Only publish state once the socket is really listening.
+        self._runner = runner
+        self.token = token
 
     async def stop(self) -> None:
-        if self._runner is not None:
-            await self._runner.cleanup()
-            self._runner = None
-            self.token = None
+        runner, self._runner = self._runner, None
+        self.token = None
+        if runner is not None:
+            # State is cleared first, so a failing cleanup still leaves the
+            # server restartable rather than wedged as "running".
+            await runner.cleanup()
 
     def status(self) -> dict:
         running = self._runner is not None
