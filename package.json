@@ -1,0 +1,27 @@
+{
+  "name": "moddock",
+  "version": "0.1.0",
+  "description": "Upload game mods from your phone or PC and manage them per game, right from Gaming Mode.",
+  "type": "module",
+  "scripts": {
+    "build": "rollup -c",
+    "watch": "rollup -c -w"
+  },
+  "license": "BSD-3-Clause",
+  "devDependencies": {
+    "@decky/api": "^1.1.2",
+    "@decky/rollup": "^1.0.1",
+    "@decky/ui": "^4.9.1",
+    "@types/react": "^19.2.18",
+    "rollup": "^4.22.0",
+    "typescript": "^5.5.0"
+  },
+  "pnpm": {
+    "peerDependencyRules": {
+      "ignoreMissing": [
+        "react",
+        "react-dom"
+      ]
+    }
+  }
+}

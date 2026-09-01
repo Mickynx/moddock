@@ -1,0 +1,11 @@
+{
+  "name": "ModDock",
+  "author": "mofan",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["mods", "utility"],
+    "description": "Upload game mods from your phone or PC over LAN and manage them per game. v1 supports Unreal Engine pak mods.",
+    "image": "https://raw.githubusercontent.com/SteamDeckHomebrew/decky-plugin-template/main/assets/thumbnail.png"
+  }
+}
