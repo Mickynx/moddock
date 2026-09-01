@@ -120,9 +120,12 @@ taps "Add Game" (see §7).
 Web upload is the only entry point. Flow:
 
 1. Completed uploads land in the inbox at `~/.local/share/moddock/inbox/`.
-2. Supported formats: `.zip` (standard library), `.7z` (bundled `py7zr`
-   dependency), and bare `.pak/.utoc/.ucas` files. `.rar` and any other
-   format is kept in the inbox and marked "unsupported format".
+2. Supported formats: `.zip` (Python standard library), `.7z` (extracted via
+   the system `bsdtar` or `7z` binary when present — Bazzite ships `bsdtar`;
+   if neither exists the entry is marked with an actionable message), and
+   bare `.pak/.utoc/.ucas` files. `.rar` and any other format is kept in the
+   inbox and marked "unsupported format". (`py7zr` was rejected: it pulls in
+   C-extension dependencies that cannot be vendored portably.)
 3. Archives are extracted to a temporary directory and scanned recursively
    for `.pak/.utoc/.ucas` files.
 4. **Pak-set validation**: when a `.utoc` exists, a same-stem `.pak` and
@@ -200,7 +203,8 @@ Lazy-loading with a user-managed game list:
 - Deployment: the template's SSH deploy flow pushes to
   `~/homebrew/plugins/moddock` on the handheld; restart Decky to load.
 - Store-readiness: `package.json`/`plugin.json` follow the
-  decky-plugin-database submission rules; the Python dependency (`py7zr`) is
-  declared as a source dependency with no prebuilt binaries.
+  decky-plugin-database submission rules; the only vendored Python dependency
+  is `segno` (pure Python, zero dependencies, BSD-licensed, used for QR SVG
+  generation), vendored as source into `py_modules/` — no prebuilt binaries.
 - All project documentation, code comments, and the README are written in
   English.
