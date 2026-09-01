@@ -5,6 +5,7 @@ import pytest
 
 from moddock.importer import (
     ImportProblem,
+    _verify_extraction_tree,
     ingest,
     inspect_upload,
     scan_mod_files,
@@ -113,3 +114,54 @@ def test_ingest_zip_blocks_path_traversal(tmp_path):
         zf.writestr("../evil.pak", "x")
     with pytest.raises(ImportProblem):
         ingest(archive, tmp_path / "store")
+
+
+def test_inspect_missing_file_reports_error(tmp_path):
+    status, reason = inspect_upload(tmp_path / "ghost.pak")
+    assert status == "error"
+    assert "not found" in reason.lower()
+
+
+def test_inspect_missing_archive_reports_error(tmp_path):
+    status, reason = inspect_upload(tmp_path / "ghost.zip")
+    assert status == "error"
+    assert "not found" in reason.lower()
+
+
+def test_ingest_missing_archive_raises_import_problem(tmp_path):
+    with pytest.raises(ImportProblem):
+        ingest(tmp_path / "ghost.zip", tmp_path / "store")
+
+
+def test_ingest_wraps_os_error_as_import_problem(tmp_path):
+    _touch(tmp_path, "single.pak")
+    dest = tmp_path / "store"
+    dest.write_bytes(b"a file where the store should be")
+    with pytest.raises(ImportProblem):
+        ingest(tmp_path / "single.pak", dest)
+
+
+def test_verify_extraction_tree_accepts_plain_files(tmp_path):
+    _touch(tmp_path, "mod.pak", "sub/mod.utoc")
+    _verify_extraction_tree(tmp_path)  # must not raise
+
+
+def test_verify_extraction_tree_rejects_symlink_escape(tmp_path):
+    dest = tmp_path / "extracted"
+    dest.mkdir()
+    outside = tmp_path / "secret.pak"
+    outside.write_bytes(b"x")
+    (dest / "link.pak").symlink_to(outside)
+    with pytest.raises(ImportProblem) as exc:
+        _verify_extraction_tree(dest)
+    assert "link.pak" in str(exc.value)
+
+
+def test_verify_extraction_tree_rejects_internal_symlink(tmp_path):
+    dest = tmp_path / "extracted"
+    dest.mkdir()
+    real = dest / "mod.pak"
+    real.write_bytes(b"x")
+    (dest / "alias.pak").symlink_to(real)
+    with pytest.raises(ImportProblem):
+        _verify_extraction_tree(dest)

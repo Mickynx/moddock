@@ -45,6 +45,29 @@ def scan_mod_files(root: Path) -> tuple[list[Path], list[str]]:
     return files, errors
 
 
+def _verify_extraction_tree(dest: Path) -> None:
+    """Reject anything an extractor may have written outside `dest`.
+
+    The zip branch pre-checks member names, but the .7z branch delegates to
+    whatever bsdtar/7z binary is on the system, so containment is verified
+    after the fact for both. Symlinks are rejected outright: a mod archive has
+    no legitimate use for them, and one can redirect a later copy or install
+    step onto an arbitrary path.
+    """
+    root = dest.resolve()
+    for entry in sorted(dest.rglob("*")):
+        if entry.is_symlink():
+            raise ImportProblem(
+                f"archive contains a symlink, which is not allowed: "
+                f"{entry.relative_to(dest)}"
+            )
+        if not entry.resolve().is_relative_to(root):
+            raise ImportProblem(
+                f"archive wrote outside the extraction directory: "
+                f"{entry.relative_to(dest)}"
+            )
+
+
 def _find_7z_command(archive: Path, dest: Path) -> list[str] | None:
     if shutil.which("bsdtar"):
         return ["bsdtar", "-xf", str(archive), "-C", str(dest)]
@@ -69,6 +92,7 @@ def extract_archive(archive: Path, dest: Path) -> None:
                 zf.extractall(dest)
         except zipfile.BadZipFile as exc:
             raise ImportProblem(f"corrupt zip file: {exc}") from exc
+        _verify_extraction_tree(dest)
     elif suffix == ".7z":
         command = _find_7z_command(archive, dest)
         if command is None:
@@ -78,12 +102,15 @@ def extract_archive(archive: Path, dest: Path) -> None:
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
             raise ImportProblem(f"7z extraction failed: {result.stderr.strip()}")
+        _verify_extraction_tree(dest)
     else:
         raise ImportProblem(f"unsupported format: {suffix or archive.name}")
 
 
 def _collect(path: Path, workdir: Path) -> tuple[list[Path], list[str]]:
     """Extract or accept `path`, returning (mod files, validation errors)."""
+    if not path.is_file():
+        raise ImportProblem(f"file not found: {path.name}")
     suffix = path.suffix.lower()
     if suffix in MOD_FILE_EXTS:
         return scan_mod_files_for_single(path)
@@ -103,10 +130,12 @@ def scan_mod_files_for_single(path: Path) -> tuple[list[Path], list[str]]:
 
 
 def inspect_upload(path: Path) -> tuple[str, str]:
+    # An upload can vanish or become unreadable between listing and inspection,
+    # so OSError is part of the expected failure surface, not a crash.
     try:
         with tempfile.TemporaryDirectory(prefix="moddock-inspect-") as tmp:
             files, errors = _collect(path, Path(tmp))
-    except ImportProblem as exc:
+    except (ImportProblem, OSError) as exc:
         return "error", str(exc)
     if errors:
         return "error", "; ".join(errors)
@@ -114,14 +143,19 @@ def inspect_upload(path: Path) -> tuple[str, str]:
 
 
 def ingest(path: Path, dest: Path) -> list[str]:
-    with tempfile.TemporaryDirectory(prefix="moddock-ingest-") as tmp:
-        files, errors = _collect(path, Path(tmp))
-        if errors:
-            raise ImportProblem("; ".join(errors))
-        names = [f.name for f in files]
-        if len(set(names)) != len(names):
-            raise ImportProblem("archive contains duplicate mod file names")
-        dest.mkdir(parents=True, exist_ok=True)
-        for f in files:
-            shutil.copy2(f, dest / f.name)
+    # Contract: every failure surfaces as ImportProblem, so filesystem errors
+    # (missing file, ENOSPC, EACCES) are wrapped rather than leaked.
+    try:
+        with tempfile.TemporaryDirectory(prefix="moddock-ingest-") as tmp:
+            files, errors = _collect(path, Path(tmp))
+            if errors:
+                raise ImportProblem("; ".join(errors))
+            names = [f.name for f in files]
+            if len(set(names)) != len(names):
+                raise ImportProblem("archive contains duplicate mod file names")
+            dest.mkdir(parents=True, exist_ok=True)
+            for f in files:
+                shutil.copy2(f, dest / f.name)
+    except OSError as exc:
+        raise ImportProblem(str(exc)) from exc
     return sorted(names)
