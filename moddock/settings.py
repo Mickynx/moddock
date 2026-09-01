@@ -15,8 +15,11 @@ class Settings:
                 loaded = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
                     self._data.update(loaded)
-            except (json.JSONDecodeError, OSError):
-                pass  # corrupt settings fall back to defaults
+            except (ValueError, OSError):
+                # Corrupt settings fall back to defaults. ValueError covers both
+                # json.JSONDecodeError and UnicodeDecodeError (undecodable bytes,
+                # e.g. a crash mid-write splitting a multi-byte sequence).
+                pass
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
