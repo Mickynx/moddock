@@ -27,8 +27,12 @@ export function InboxView({
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
-    listInbox().then(setEntries);
-    getManagedGames().then(setGames);
+    listInbox()
+      .then(setEntries)
+      .catch((e) => setError(`Could not read the inbox: ${String(e)}`));
+    getManagedGames()
+      .then(setGames)
+      .catch((e) => setError(`Could not load games: ${String(e)}`));
   }, []);
 
   useEffect(refresh, [refresh, refreshKey]);
@@ -42,7 +46,7 @@ export function InboxView({
           <div style={{ color: "#ff6a6a" }}>{error}</div>
         </PanelSectionRow>
       )}
-      {entries.length === 0 && (
+      {!error && entries.length === 0 && (
         <PanelSectionRow>
           <div>Empty. Enable the upload service and send a file.</div>
         </PanelSectionRow>
@@ -63,12 +67,16 @@ export function InboxView({
                 selectedOption={null}
                 strDefaultLabel="Assign to game…"
                 onChange={async (option) => {
-                  const result = await assignInboxEntry(
-                    entry.filename,
-                    option.data as string,
-                    entry.filename.replace(/\.[^.]+$/, ""),
-                  );
-                  setError(result.ok ? null : result.error);
+                  try {
+                    const result = await assignInboxEntry(
+                      entry.filename,
+                      option.data as string,
+                      entry.filename.replace(/\.[^.]+$/, ""),
+                    );
+                    setError(result.ok ? null : result.error);
+                  } catch (e) {
+                    setError(`Install failed: ${String(e)}`);
+                  }
                   refresh();
                 }}
               />
@@ -76,7 +84,11 @@ export function InboxView({
             <ButtonItem
               layout="below"
               onClick={async () => {
-                await deleteInboxEntry(entry.filename);
+                try {
+                  await deleteInboxEntry(entry.filename);
+                } catch (e) {
+                  setError(`Delete failed: ${String(e)}`);
+                }
                 refresh();
               }}
             >

@@ -26,9 +26,17 @@ export function GameDetailView({
   const [mods, setMods] = useState<ModEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // Assume installed until the backend says otherwise, so the hint row does
+  // not flash on the way in.
+  const [installed, setInstalled] = useState(true);
 
   const refresh = useCallback(() => {
-    listMods(appid).then((r) => setMods(r.mods));
+    listMods(appid)
+      .then((r) => {
+        setMods(r.mods);
+        setInstalled(r.installed);
+      })
+      .catch((e) => setError(`Could not load mods: ${String(e)}`));
   }, [appid]);
 
   useEffect(refresh, [refresh]);
@@ -41,7 +49,14 @@ export function GameDetailView({
             <div style={{ color: "#ff6a6a" }}>{error}</div>
           </PanelSectionRow>
         )}
-        {mods.length === 0 && (
+        {!installed && (
+          <PanelSectionRow>
+            <div>
+              Game not detected as installed — mod files cannot be changed.
+            </div>
+          </PanelSectionRow>
+        )}
+        {installed && mods.length === 0 && (
           <PanelSectionRow>
             <div>No mods yet — upload one from the Inbox.</div>
           </PanelSectionRow>
@@ -50,6 +65,7 @@ export function GameDetailView({
           <PanelSectionRow key={mod.name}>
             <ToggleField
               label={mod.name}
+              disabled={!installed}
               description={
                 mod.state === "partial"
                   ? "partial — some files missing"
@@ -57,8 +73,12 @@ export function GameDetailView({
               }
               checked={mod.state === "enabled"}
               onChange={async (value) => {
-                const result = await setModEnabled(appid, mod.name, value);
-                setError(result.ok ? null : result.error);
+                try {
+                  const result = await setModEnabled(appid, mod.name, value);
+                  setError(result.ok ? null : result.error);
+                } catch (e) {
+                  setError(String(e));
+                }
                 refresh();
               }}
             />
@@ -68,13 +88,18 @@ export function GameDetailView({
           <PanelSectionRow key={`del-${mod.name}`}>
             <ButtonItem
               layout="below"
+              disabled={!installed}
               onClick={async () => {
                 if (confirmDelete !== mod.name) {
                   setConfirmDelete(mod.name);
                   return;
                 }
-                const result = await deleteMod(appid, mod.name);
-                setError(result.ok ? null : result.error);
+                try {
+                  const result = await deleteMod(appid, mod.name);
+                  setError(result.ok ? null : result.error);
+                } catch (e) {
+                  setError(String(e));
+                }
                 setConfirmDelete(null);
                 refresh();
               }}
@@ -91,7 +116,13 @@ export function GameDetailView({
           <ButtonItem
             layout="below"
             onClick={async () => {
-              await removeGame(appid);
+              try {
+                await removeGame(appid);
+              } catch (e) {
+                // Stay on this view so the error stays visible.
+                setError(`Could not remove the game: ${String(e)}`);
+                return;
+              }
               onBack();
             }}
           >

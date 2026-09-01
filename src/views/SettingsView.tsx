@@ -14,10 +14,17 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
     url: null,
     qr_svg: null,
   });
+  // Transport-level failure, as opposed to status.error which the backend
+  // reports when the server could not bind.
+  const [callError, setCallError] = useState<string | null>(null);
 
   useEffect(() => {
-    getUploaderStatus().then(setStatus);
+    getUploaderStatus()
+      .then(setStatus)
+      .catch((e) => setCallError(`Could not read the status: ${String(e)}`));
   }, []);
+
+  const error = callError ?? status.error;
 
   return (
     <PanelSection title="Web Upload">
@@ -26,12 +33,21 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
           label="Upload service"
           description="Serves an upload page on your LAN"
           checked={status.running}
-          onChange={async (value) => setStatus(await setUploader(value))}
+          onChange={async (value) => {
+            try {
+              setStatus(await setUploader(value));
+              setCallError(null);
+            } catch (e) {
+              setCallError(
+                `Could not ${value ? "start" : "stop"} the service: ${String(e)}`,
+              );
+            }
+          }}
         />
       </PanelSectionRow>
-      {status.error && (
+      {error && (
         <PanelSectionRow>
-          <div style={{ color: "#ff6a6a" }}>{status.error}</div>
+          <div style={{ color: "#ff6a6a" }}>{error}</div>
         </PanelSectionRow>
       )}
       {status.running && status.url && (

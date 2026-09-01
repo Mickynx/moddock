@@ -13,20 +13,31 @@ export function GamesView({
 }) {
   const [games, setGames] = useState<ManagedGame[]>([]);
   const [inboxCount, setInboxCount] = useState(0);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    getManagedGames().then(setGames);
-    listInbox().then((entries) => setInboxCount(entries.length));
+    getManagedGames()
+      .then(setGames)
+      .catch((e) => setError(`Could not load games: ${String(e)}`));
+    listInbox()
+      .then((entries) => setInboxCount(entries.length))
+      .catch((e) => setError(`Could not read the inbox: ${String(e)}`));
   }, [inboxTick]);
 
   return (
     <>
       <PanelSection title="Games">
+        {error && (
+          <PanelSectionRow>
+            <div style={{ color: "#ff6a6a" }}>{error}</div>
+          </PanelSectionRow>
+        )}
         {games.map((g) => (
           <PanelSectionRow key={g.appid}>
+            {/* Kept enabled even when not installed, so the game stays
+                reachable for removal from the detail view. */}
             <ButtonItem
               layout="below"
-              disabled={!g.installed}
               description={
                 g.installed
                   ? g.is_iostore
