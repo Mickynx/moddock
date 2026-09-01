@@ -41,6 +41,33 @@ def test_detects_iostore(tmp_path):
     assert info.is_iostore is True
 
 
+def test_installed_utoc_mod_does_not_flip_iostore(tmp_path):
+    # ~mods is written by ModDock itself; a mod's .utoc must not be mistaken
+    # for evidence that the base game is packaged with IoStore.
+    _make_ue_game(tmp_path, project="SB", iostore=False)
+    mods = tmp_path / "SB" / "Content" / "Paks" / MODS_DIR_NAME
+    mods.mkdir()
+    (mods / "CoolMod_P.pak").touch()
+    (mods / "CoolMod_P.utoc").touch()
+    (mods / "CoolMod_P.ucas").touch()
+    info = detect_ue_game(tmp_path)
+    assert info is not None
+    assert info.is_iostore is False
+
+
+def test_iostore_detected_in_nested_platform_dir(tmp_path):
+    # Some titles nest base paks under Paks/<Platform>/, so recursion outside
+    # ~mods must be preserved.
+    _make_ue_game(tmp_path, project="SB", iostore=False)
+    nested = tmp_path / "SB" / "Content" / "Paks" / "Windows"
+    nested.mkdir()
+    (nested / "SB-Windows.utoc").touch()
+    (nested / "SB-Windows.ucas").touch()
+    info = detect_ue_game(tmp_path)
+    assert info is not None
+    assert info.is_iostore is True
+
+
 def test_rejects_game_without_engine_dir(tmp_path):
     (tmp_path / "SB" / "Content" / "Paks").mkdir(parents=True)
     assert detect_ue_game(tmp_path) is None

@@ -36,7 +36,13 @@ def detect_ue_game(install_dir: Path) -> UEGameInfo | None:
     if len(candidates) != 1:
         return None
     project_name, paks_dir = candidates[0]
-    is_iostore = next(paks_dir.rglob("*.utoc"), None) is not None
+    # Recurse (some titles nest base paks under Paks/<Platform>/) but skip
+    # ~mods: that subtree is written by ModDock, and an installed IoStore mod
+    # must not be mistaken for evidence about how the base game is packaged.
+    is_iostore = any(
+        MODS_DIR_NAME not in p.relative_to(paks_dir).parts
+        for p in paks_dir.rglob("*.utoc")
+    )
     binaries = install_dir / project_name / "Binaries"
     has_shipping_exe = binaries.is_dir() and (
         next(binaries.rglob("*-Win64-Shipping.exe"), None) is not None
