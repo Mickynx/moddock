@@ -20,11 +20,11 @@ def _game(tmp_path: Path) -> UEGameInfo:
     )
 
 
-def _archive(tmp_path: Path, name: str = "ScarletHead.zip") -> Path:
+def _archive(tmp_path: Path, name: str = "ScarletHead.zip", stem: str = "scarlet") -> Path:
     archive = tmp_path / name
     with zipfile.ZipFile(archive, "w") as zf:
         for ext in ("pak", "utoc", "ucas"):
-            zf.writestr(f"scarlet.{ext}", "x")
+            zf.writestr(f"{stem}.{ext}", "x")
     return archive
 
 
@@ -80,6 +80,73 @@ def test_duplicate_mod_name_rejected(tmp_path):
     store.import_mod("1", game, "Scarlet", _archive(tmp_path))
     with pytest.raises(StoreError):
         store.import_mod("1", game, "Scarlet", _archive(tmp_path, "other.zip"))
+
+
+def test_file_basename_conflict_between_mods_rejected(tmp_path):
+    """Two mods for one game may not claim the same internal file name: the
+    manifest's basenames are what delete/toggle act on, so a collision would
+    make one mod destroy the other's files."""
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    store.import_mod("1", game, "Scarlet v1", _archive(tmp_path))
+
+    with pytest.raises(StoreError) as excinfo:
+        store.import_mod("1", game, "Scarlet v2", _archive(tmp_path, "other.zip"))
+    message = str(excinfo.value)
+    assert "scarlet.pak" in message
+    assert "Scarlet v1" in message
+
+    # The rejected mod leaves nothing behind: no repo dir, no manifest entry.
+    assert not (tmp_path / "base" / "mods" / "1" / "Scarlet v2").exists()
+    assert [m["name"] for m in store.list_mods("1", game)] == ["Scarlet v1"]
+
+    # A mod with distinct file names still imports fine.
+    store.import_mod("1", game, "Other", _archive(tmp_path, "o.zip", stem="other"))
+    assert len(store.list_mods("1", game)) == 2
+
+
+def test_delete_without_game_refuses_and_keeps_manifest(tmp_path):
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    store.set_enabled("1", game, "Scarlet", True)
+
+    with pytest.raises(StoreError):
+        store.delete_mod("1", None, "Scarlet")
+
+    assert [m["name"] for m in store.list_mods("1", game)] == ["Scarlet"]
+    assert (game.mods_dir / "scarlet.pak").is_file()
+
+
+def test_set_enabled_wraps_os_error(tmp_path, monkeypatch):
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+
+    def boom(*args, **kwargs):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr("moddock.store.shutil.move", boom)
+    with pytest.raises(StoreError) as excinfo:
+        store.set_enabled("1", game, "Scarlet", True)
+    assert "No space left on device" in str(excinfo.value)
+
+
+def test_delete_mod_wraps_os_error(tmp_path, monkeypatch):
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+
+    real_unlink = Path.unlink
+
+    def boom(self, *args, **kwargs):
+        raise OSError("Permission denied")
+
+    monkeypatch.setattr(Path, "unlink", boom)
+    with pytest.raises(StoreError) as excinfo:
+        store.delete_mod("1", game, "Scarlet")
+    assert "Permission denied" in str(excinfo.value)
+    monkeypatch.setattr(Path, "unlink", real_unlink)
 
 
 def test_delete_enabled_mod_removes_files_everywhere(tmp_path):

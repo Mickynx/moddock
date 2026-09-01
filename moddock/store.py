@@ -84,6 +84,22 @@ class ModStore:
 
     # -- operations ---------------------------------------------------------
 
+    @staticmethod
+    def _find_file_conflict(
+        manifest: dict, files: list[str]
+    ) -> tuple[str, str] | None:
+        """Return (owning mod, file name) for the first already-claimed file."""
+        claimed = {
+            f: name
+            for name, entry in sorted(manifest["mods"].items())
+            for f in entry["files"]
+        }
+        for f in files:
+            owner = claimed.get(f)
+            if owner is not None:
+                return owner, f
+        return None
+
     def import_mod(
         self, appid: str, game: UEGameInfo, mod_name: str, source: Path
     ) -> dict:
@@ -96,6 +112,20 @@ class ModStore:
             files = ingest(source, repo)
         except ImportProblem as exc:
             raise StoreError(str(exc)) from exc
+        # File names must be unique across a game's mods: enable/disable and
+        # delete address files by base name, so two mods claiming the same name
+        # would let one destroy or hijack the other's files. Such mods could
+        # never be co-enabled anyway (~mods is a flat directory), so rejecting
+        # the second import is the honest failure. The check needs the ingested
+        # file list, hence it lands after extraction; the repo dir the failed
+        # import just created is removed so nothing is left half-imported.
+        conflict = self._find_file_conflict(manifest, files)
+        if conflict is not None:
+            other_name, filename = conflict
+            shutil.rmtree(repo, ignore_errors=True)
+            raise StoreError(
+                f'file "{filename}" conflicts with existing mod "{other_name}"'
+            )
         manifest["mods"][mod_name] = {
             "files": files,
             "source": source.name,
@@ -136,31 +166,48 @@ class ModStore:
             raise StoreError(f'unknown mod "{mod_name}"')
         repo = Path(entry["repo"])
         src_dir, dst_dir = (repo, game.mods_dir) if enabled else (game.mods_dir, repo)
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        moves = []
-        for f in entry["files"]:
-            src, dst = src_dir / f, dst_dir / f
-            if not src.is_file():
-                continue  # already on the target side, or lost (partial)
-            if dst.exists():
-                raise StoreError(
-                    f'cannot move "{f}": a file with that name already exists'
-                )
-            moves.append((src, dst))
-        for src, dst in moves:
-            shutil.move(str(src), str(dst))
+        # Filesystem errors (ENOSPC, EACCES, a card pulled mid-move) become
+        # StoreError so callers only ever handle one exception type. A move
+        # that dies partway leaves the mod in the "partial" state, which
+        # list_mods reports and a second toggle repairs.
+        try:
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            moves = []
+            for f in entry["files"]:
+                src, dst = src_dir / f, dst_dir / f
+                if not src.is_file():
+                    continue  # already on the target side, or lost (partial)
+                if dst.exists():
+                    raise StoreError(
+                        f'cannot move "{f}": a file with that name already exists'
+                    )
+                moves.append((src, dst))
+            for src, dst in moves:
+                shutil.move(str(src), str(dst))
+        except OSError as exc:
+            raise StoreError(str(exc)) from exc
 
     def delete_mod(
         self, appid: str, game: UEGameInfo | None, mod_name: str
     ) -> None:
         manifest = self._load_manifest(appid)
-        entry = manifest["mods"].pop(mod_name, None)
+        entry = manifest["mods"].get(mod_name)
         if entry is None:
             raise StoreError(f'unknown mod "{mod_name}"')
+        if game is None:
+            # Without a detected game there is no ~mods path, so an enabled
+            # mod's installed files would be orphaned there while the manifest
+            # forgot about them. Refuse instead of half-deleting.
+            raise StoreError("game is not installed — cannot delete mod files safely")
         repo = Path(entry["repo"])
-        for f in entry["files"]:
-            (repo / f).unlink(missing_ok=True)
-            if game is not None:
+        try:
+            for f in entry["files"]:
+                (repo / f).unlink(missing_ok=True)
                 (game.mods_dir / f).unlink(missing_ok=True)
-        shutil.rmtree(repo, ignore_errors=True)
+            shutil.rmtree(repo, ignore_errors=True)
+        except OSError as exc:
+            # The manifest entry is deliberately kept so the mod stays known
+            # and the user can retry the delete.
+            raise StoreError(str(exc)) from exc
+        del manifest["mods"][mod_name]
         self._save_manifest(appid, manifest)
