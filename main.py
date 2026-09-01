@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -138,10 +139,16 @@ class Plugin:
 
     async def list_inbox(self) -> list[dict]:
         entries = []
+        loop = asyncio.get_running_loop()
         for path in sorted(INBOX_DIR.iterdir()):
             if not path.is_file():
                 continue
-            status, detail = inspect_upload(path)
+            # inspect_upload extracts archives (and shells out for .7z), which
+            # can take seconds per file. This is the refresh path — panel open
+            # plus every "moddock_upload" event — so it must not run on the
+            # event loop: doing so would stall Decky and our own aiohttp
+            # uploader, which share that loop.
+            status, detail = await loop.run_in_executor(None, inspect_upload, path)
             entries.append(
                 {"filename": path.name, "status": status, "detail": detail}
             )
