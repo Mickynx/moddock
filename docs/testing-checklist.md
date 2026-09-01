@@ -15,7 +15,9 @@ Test game: Stellar Blade. Test mod: Seamless EVE Scarlet Head
 7. [ ] Inbox: entries show "ready"; a `.rar` shows an unsupported note.
 8. [ ] Assign to Stellar Blade: mod appears in the game view, enabled;
        files exist in `SB/Content/Paks/~mods/`.
-9. [ ] Toggle off: files return to `~/.local/share/moddock/mods/<appid>/`.
+9. [ ] Toggle off: files return to `~/.local/share/moddock/mods/<appid>/<mod
+       name>/` (for a game on another drive:
+       `<library>/.moddock/<appid>/<mod name>/`).
 10. [ ] Launch the game with the mod enabled: no crash, head swapped.
 11. [ ] Delete mod with confirmation: files gone from both locations.
 12. [ ] Remove game from list: mods manifest untouched on disk.
