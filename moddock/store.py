@@ -126,6 +126,21 @@ class ModStore:
             raise StoreError(
                 f'file "{filename}" conflicts with existing mod "{other_name}"'
             )
+        # Same reasoning for files ModDock does not know about: a mod installed
+        # by hand into ~mods carries no manifest entry, so adopting its name
+        # would let a later disable or delete move or unlink a file ModDock
+        # never put there. Refusing keeps the invariant that every managed
+        # basename in ~mods belongs to ModDock by construction.
+        unmanaged = next(
+            (f for f in files if (game.mods_dir / f).is_file()), None
+        )
+        if unmanaged is not None:
+            shutil.rmtree(repo, ignore_errors=True)
+            raise StoreError(
+                f'file "{unmanaged}" already exists in the game\'s ~mods '
+                "directory and is not managed by ModDock — remove it by hand "
+                "first"
+            )
         manifest["mods"][mod_name] = {
             "files": files,
             "source": source.name,

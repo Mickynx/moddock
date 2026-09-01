@@ -227,3 +227,11 @@ async def test_failed_bind_leaves_server_stoppable(tmp_path):
         await second.stop()
     finally:
         await first.stop()
+
+
+def test_sanitize_filename_keeps_non_ascii_uploads():
+    """A fully non-ASCII stem must not be reported as a bad file type."""
+    assert sanitize_filename("中文模组.zip") == "upload.zip"
+    assert sanitize_filename("中文模组.pak") == "upload.pak"
+    # A disallowed suffix is still refused, non-ASCII stem or not.
+    assert sanitize_filename("中文模组.exe") is None

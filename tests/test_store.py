@@ -198,3 +198,25 @@ def test_cross_partition_repo_fallback(tmp_path, monkeypatch):
     monkeypatch.setattr("moddock.store._device_of", fake_dev)
     store.import_mod("7", game, "M", _archive(tmp_path))
     assert (lib / ".moddock" / "7" / "M").is_dir()
+
+
+def test_import_rejects_file_already_unmanaged_in_mods_dir(tmp_path):
+    """A hand-installed file in ~mods must never become ModDock-managed.
+
+    Otherwise delete_mod would happily unlink a file ModDock never put there.
+    """
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    game.mods_dir.mkdir(parents=True)
+    (game.mods_dir / "scarlet.pak").write_bytes(b"hand-installed")
+
+    with pytest.raises(StoreError) as exc:
+        store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+
+    message = str(exc.value)
+    assert "scarlet.pak" in message
+    assert "~mods" in message
+    # Nothing half-imported: no repo directory, no manifest entry.
+    assert not (tmp_path / "base" / "mods" / "1" / "Scarlet").exists()
+    assert not (tmp_path / "base" / "manifest" / "1.json").exists()
+    assert (game.mods_dir / "scarlet.pak").read_bytes() == b"hand-installed"

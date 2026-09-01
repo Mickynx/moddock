@@ -67,19 +67,33 @@ def sanitize_filename(name: str) -> str | None:
         return None
     base = PureWindowsPath(normalized).name
     base = Path(base).name
-    base = _FILENAME_RE.sub("", base).strip()
-    if not base or base.startswith("."):
+    cleaned = _FILENAME_RE.sub("", base).strip()
+    if not cleaned:
         return None
-    suffix = Path(base).suffix
+    # Split on the last dot of the sanitized name rather than via Path, so a
+    # name whose stem sanitized away entirely (".zip") still exposes its
+    # extension instead of looking like a dotfile.
+    stem, dot, ext = cleaned.rpartition(".")
+    suffix = f".{ext}" if dot else ""
     if suffix.lower() not in ALLOWED_UPLOAD_EXTS:
         return None
-    if len(base) > MAX_FILENAME_LEN:
+    stem = stem.strip()
+    if stem.startswith("."):
+        # A dotfile (or the remains of an escaped traversal such as
+        # "..%2F..%2Fpwned.zip") is never a legitimate upload name.
+        return None
+    if not stem:
+        # A fully non-ASCII name (e.g. 中文模组.zip) leaves nothing behind. The
+        # file type is fine, so keep the upload under a generic stem rather
+        # than rejecting it with a misleading "type not allowed"; _unique_path
+        # de-duplicates if several arrive.
+        stem = "upload"
+    if len(stem) + len(suffix) > MAX_FILENAME_LEN:
         # Clamp rather than reject: the filesystem would raise ENAMETOOLONG.
-        stem = Path(base).stem[: MAX_FILENAME_LEN - len(suffix)].strip()
-        if not stem or stem.startswith("."):
+        stem = stem[: MAX_FILENAME_LEN - len(suffix)].strip()
+        if not stem:
             return None
-        base = stem + suffix
-    return base
+    return stem + suffix
 
 
 def get_lan_ip() -> str:

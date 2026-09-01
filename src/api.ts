@@ -40,8 +40,10 @@ export interface UploaderStatus {
   running: boolean;
   url: string | null;
   qr_svg: string | null;
-  // Set when the upload server failed to start (e.g. port already in use);
-  // in that case `running` is false.
+  // The configured LAN port; the backend always reports it, running or not.
+  port?: number;
+  // Set when the upload server failed to start (e.g. port already in use) or
+  // when a requested port was rejected.
   error?: string | null;
 }
 
@@ -68,3 +70,5 @@ export const setUploader =
   callable<[enabled: boolean], UploaderStatus>("set_uploader");
 export const getUploaderStatus =
   callable<[], UploaderStatus>("get_uploader_status");
+export const setUploadPort =
+  callable<[port: number], UploaderStatus>("set_upload_port");

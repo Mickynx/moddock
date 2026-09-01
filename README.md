@@ -9,8 +9,9 @@ pak-style mods.
 1. Add a game — ModDock scans your Steam libraries and detects
    Unreal Engine games automatically.
 2. Toggle on the upload service and scan the QR code with your phone.
-3. Upload a mod archive (`.zip`/`.7z`) or bare `.pak`/`.utoc`/`.ucas`
-   files from any browser on your LAN.
+3. Upload a mod archive (`.zip`/`.7z`) or a bare `.pak` from any
+   browser on your LAN. A `.utoc`/`.ucas` cannot stand alone — send
+   those inside an archive together with their matching `.pak`.
 4. Assign the upload to a game, then enable/disable mods per game.
 
 Mods live in a central store under `~/.local/share/moddock/`;
