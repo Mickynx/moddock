@@ -75,9 +75,11 @@ def test_discover_libraries_includes_root_and_extra(tmp_path):
 def test_discover_libraries_skips_missing_paths(tmp_path):
     steam_root = tmp_path / "Steam"
     _make_library(steam_root, "1", "A", "GameA")
+    # Anchor the dangling path inside tmp_path so the negative case stays
+    # hermetic: on real hardware with an SD card, /run/media/mmcblk0p1 exists.
     vdf = LIBRARYFOLDERS_VDF.replace(
         "/home/user/.local/share/Steam", str(steam_root)
-    )  # sd path left dangling
+    ).replace("/run/media/mmcblk0p1", str(tmp_path / "missing"))
     (steam_root / "steamapps" / "libraryfolders.vdf").write_text(vdf)
 
     assert discover_libraries(steam_root) == [steam_root]
