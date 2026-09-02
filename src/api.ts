@@ -17,6 +17,9 @@ export interface ManagedGame {
 export interface ModEntry {
   name: string;
   state: "enabled" | "disabled" | "partial";
+  // Name of the install method that placed the mod; "legacy" for mods stored
+  // before methods existed.
+  recipe_name: string;
 }
 
 export interface ModsResponse {
@@ -41,6 +44,15 @@ export interface UploaderStatus {
   error?: string | null;
 }
 
+export interface RecipeSummary {
+  id: string;
+  name: string;
+  builtin: boolean;
+  // A rule count, not the rules themselves: enough to hint at how elaborate
+  // a method is.
+  rules: number;
+}
+
 export const scanGames = callable<[], ScannedGame[]>("scan_games");
 export const getManagedGames = callable<[], ManagedGame[]>("get_managed_games");
 export const addGame =
@@ -59,3 +71,6 @@ export const getUploaderStatus =
   callable<[], UploaderStatus>("get_uploader_status");
 export const setUploadPort =
   callable<[port: number], UploaderStatus>("set_upload_port");
+export const listRecipes = callable<[], RecipeSummary[]>("list_recipes");
+export const deleteRecipe =
+  callable<[recipe_id: string], OpResult>("delete_recipe");

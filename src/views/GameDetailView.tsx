@@ -74,7 +74,9 @@ export function GameDetailView({
               description={
                 mod.state === "partial"
                   ? "partial — some files missing"
-                  : "takes effect on next launch"
+                  : // Which install method placed it, so a mod's destinations
+                    // stay explainable after the fact.
+                    `${mod.recipe_name} · takes effect on next launch`
               }
               checked={mod.state === "enabled"}
               onChange={async (value) => {
