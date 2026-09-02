@@ -218,3 +218,54 @@ def ingest(path: Path, dest: Path) -> list[str]:
         # ImportProblem" contract callers (ModStore) rely on.
         raise ImportProblem(str(exc)) from exc
     return sorted(names)
+
+
+def _strip_wrappers(root: Path) -> Path:
+    """Descend through single-directory wrappers (the usual packaging shell)."""
+    current = root
+    while True:
+        entries = list(current.iterdir())
+        dirs = [p for p in entries if p.is_dir()]
+        files = [p for p in entries if p.is_file()]
+        if len(dirs) == 1 and not files:
+            current = dirs[0]
+        else:
+            return current
+
+
+def ingest_tree(source: Path, dest: Path) -> list[str]:
+    """Extract/copy `source` into `dest` preserving the (unwrapped) tree.
+
+    Returns sorted POSIX relative paths. No extension filtering happens
+    here — the recipe engine decides what each file means. All failures
+    surface as ImportProblem.
+    """
+    try:
+        if not source.is_file():
+            raise ImportProblem(f"file not found: {source.name}")
+        with _scratch_dir("moddock-ingest-") as tmp:
+            workdir = Path(tmp)
+            if source.suffix.lower() in ARCHIVE_EXTS:
+                extract_archive(source, workdir)
+                root = _strip_wrappers(workdir)
+            else:
+                shutil.copy2(source, workdir / source.name)
+                root = workdir
+            files = sorted(
+                p.relative_to(root).as_posix()
+                for p in root.rglob("*")
+                if p.is_file()
+            )
+            if not files:
+                raise ImportProblem("the archive contains no files")
+            for rel in files:
+                target = dest / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(root / rel, target)
+        return files
+    except OSError as exc:
+        raise ImportProblem(str(exc)) from exc
+    except (RuntimeError, NotImplementedError) as exc:
+        # Same belt-and-braces as ingest(): no archive backend may break the
+        # "every failure is an ImportProblem" contract callers rely on.
+        raise ImportProblem(str(exc)) from exc

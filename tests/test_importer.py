@@ -278,3 +278,58 @@ def test_pak_set_errors_pure_helper():
     assert pak_set_errors(["solo.pak"]) == []
     errors = pak_set_errors(["mod.pak", "mod.utoc"])
     assert errors and ".ucas" in errors[0]
+
+
+def test_ingest_tree_preserves_structure(tmp_path):
+    from moddock.importer import ingest_tree
+
+    archive = tmp_path / "m.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("mod.pak", "x")
+        zf.writestr("Mods/My/scripts/main.lua", "x")
+    dest = tmp_path / "repo"
+    assert ingest_tree(archive, dest) == ["Mods/My/scripts/main.lua", "mod.pak"]
+    assert (dest / "Mods/My/scripts/main.lua").is_file()
+
+
+def test_ingest_tree_strips_wrapper_dirs(tmp_path):
+    from moddock.importer import ingest_tree
+
+    archive = tmp_path / "m.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("Wrapper/Inner/mod.pak", "x")
+        zf.writestr("Wrapper/Inner/readme.txt", "x")
+    tree = ingest_tree(archive, tmp_path / "repo")
+    assert tree == ["mod.pak", "readme.txt"]
+
+
+def test_ingest_tree_bare_file(tmp_path):
+    from moddock.importer import ingest_tree
+
+    (tmp_path / "solo.pak").write_bytes(b"x")
+    assert ingest_tree(tmp_path / "solo.pak", tmp_path / "repo") == ["solo.pak"]
+
+
+def test_ingest_tree_empty_archive_raises(tmp_path):
+    from moddock.importer import ImportProblem, ingest_tree
+
+    archive = tmp_path / "empty.zip"
+    with zipfile.ZipFile(archive, "w"):
+        pass
+    with pytest.raises(ImportProblem):
+        ingest_tree(archive, tmp_path / "repo")
+
+
+def test_ingest_tree_wraps_os_errors(tmp_path, monkeypatch):
+    from moddock.importer import ImportProblem, ingest_tree
+
+    archive = tmp_path / "m.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("mod.pak", "x")
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("moddock.importer.shutil.copy2", boom)
+    with pytest.raises(ImportProblem):
+        ingest_tree(archive, tmp_path / "repo")
