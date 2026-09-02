@@ -269,3 +269,12 @@ def test_7z_extraction_timeout_is_reported(tmp_path, monkeypatch):
     with pytest.raises(ImportProblem) as exc:
         ingest(archive, tmp_path / "store")
     assert "timed out" in str(exc.value).lower()
+
+
+def test_pak_set_errors_pure_helper():
+    from moddock.importer import pak_set_errors
+
+    assert pak_set_errors(["a/mod.pak", "a/mod.utoc", "a/mod.ucas"]) == []
+    assert pak_set_errors(["solo.pak"]) == []
+    errors = pak_set_errors(["mod.pak", "mod.utoc"])
+    assert errors and ".ucas" in errors[0]

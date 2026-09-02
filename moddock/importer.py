@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 MOD_FILE_EXTS = {".pak", ".utoc", ".ucas"}
 ARCHIVE_EXTS = {".zip", ".7z"}
@@ -40,19 +40,15 @@ class ImportProblem(Exception):
     """User-facing import failure; str(exc) is shown in the inbox."""
 
 
-def scan_mod_files(root: Path) -> tuple[list[Path], list[str]]:
-    files = sorted(
-        p
-        for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in MOD_FILE_EXTS
-    )
-    errors: list[str] = []
-    if not files:
-        errors.append("no .pak/.utoc/.ucas files found")
-        return files, errors
+def pak_set_errors(names) -> list[str]:
+    """Pak-set rule over relative path strings: a stem with a .utoc or .ucas
+    must have all three members; a standalone .pak is fine."""
     by_stem: dict[str, set[str]] = {}
-    for p in files:
-        by_stem.setdefault(p.stem, set()).add(p.suffix.lower())
+    for name in names:
+        p = PurePosixPath(str(name).replace("\\", "/"))
+        if p.suffix.lower() in MOD_FILE_EXTS:
+            by_stem.setdefault(p.stem, set()).add(p.suffix.lower())
+    errors: list[str] = []
     for stem, exts in sorted(by_stem.items()):
         if exts & {".utoc", ".ucas"}:
             missing = {".pak", ".utoc", ".ucas"} - exts
@@ -61,7 +57,18 @@ def scan_mod_files(root: Path) -> tuple[list[Path], list[str]]:
                     f"{stem}: incomplete pak set, missing "
                     + ", ".join(sorted(missing))
                 )
-    return files, errors
+    return errors
+
+
+def scan_mod_files(root: Path) -> tuple[list[Path], list[str]]:
+    files = sorted(
+        p
+        for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in MOD_FILE_EXTS
+    )
+    if not files:
+        return files, ["no .pak/.utoc/.ucas files found"]
+    return files, pak_set_errors(files)
 
 
 def _verify_extraction_tree(dest: Path) -> None:
