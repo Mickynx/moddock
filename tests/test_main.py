@@ -5,6 +5,7 @@ import zipfile
 from pathlib import Path
 
 import aiohttp
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 
@@ -48,6 +49,8 @@ def test_plugin_imports_and_has_callables(tmp_path):
         "set_uploader",
         "get_uploader_status",
         "set_upload_port",
+        "list_recipes",
+        "delete_recipe",
         "_main",
         "_unload",
     ):
@@ -70,7 +73,14 @@ def _ue_tree(tmp_path) -> Path:
     install = tmp_path / "game"
     (install / "Engine").mkdir(parents=True)
     (install / "SB" / "Content" / "Paks").mkdir(parents=True)
+    # Present so the win64_dir anchor resolves; recipes that target it are
+    # otherwise refused for this game.
+    (install / "SB" / "Binaries" / "Win64").mkdir(parents=True)
     return install
+
+
+ALL_ANCHORS = ["game_root", "paks_dir", "win64_dir"]
+PAKS_RECIPE = "ue-paks-mods"
 
 
 def _mod_zip(path: Path, stem: str = "scarlet") -> Path:
@@ -82,6 +92,7 @@ def _mod_zip(path: Path, stem: str = "scarlet") -> Path:
 
 def _wired_plugin(main, tmp_path, monkeypatch):
     """A Plugin with settings/store wired to tmp dirs, as _main would do."""
+    from moddock.recipes import RecipeStore
     from moddock.settings import Settings
     from moddock.store import ModStore
 
@@ -93,6 +104,7 @@ def _wired_plugin(main, tmp_path, monkeypatch):
     plugin = main.Plugin()
     plugin.settings = Settings(tmp_path / "settings.json")
     plugin.store = ModStore(base)
+    plugin.recipes = RecipeStore(tmp_path / "recipes.json")
     plugin.uploader = None
     return plugin, staging
 
@@ -105,7 +117,23 @@ async def test_upload_games_lists_only_installed(tmp_path, monkeypatch):
     await plugin.add_game("2", "Gone Game", str(tmp_path / "nowhere"))
 
     assert await plugin._upload_games() == [
-        {"appid": "1", "name": "Stellar Blade"}
+        {"appid": "1", "name": "Stellar Blade", "anchors": ALL_ANCHORS}
+    ]
+
+
+async def test_upload_games_omits_anchors_the_game_lacks(tmp_path, monkeypatch):
+    main = _import_main(tmp_path)
+    plugin, _staging = _wired_plugin(main, tmp_path, monkeypatch)
+    install = _ue_tree(tmp_path)
+    (install / "SB" / "Binaries" / "Win64").rmdir()
+    await plugin.add_game("1", "Stellar Blade", str(install))
+
+    assert await plugin._upload_games() == [
+        {
+            "appid": "1",
+            "name": "Stellar Blade",
+            "anchors": ["game_root", "paks_dir"],
+        }
     ]
 
 
@@ -117,12 +145,18 @@ async def test_install_upload_end_to_end(tmp_path, monkeypatch):
     await plugin.add_game("1", "Stellar Blade", str(install))
     upload = _mod_zip(staging / "ScarletHead.zip")
 
-    ok, detail = await plugin._install_upload(upload, "1")
+    ok, detail = await plugin._install_upload(upload, "1", PAKS_RECIPE)
     assert (ok, detail) == (True, "ScarletHead")
 
     mods = await plugin.list_mods("1")
     assert mods["installed"] is True
-    assert mods["mods"] == [{"name": "ScarletHead", "state": "enabled"}]
+    assert mods["mods"] == [
+        {
+            "name": "ScarletHead",
+            "state": "enabled",
+            "recipe_name": "UE ~mods (pak)",
+        }
+    ]
     mods_dir = install / "SB" / "Content" / "Paks" / "~mods"
     assert (mods_dir / "scarlet.pak").is_file()
     # The repository keeps its copy while the mod is enabled.
@@ -145,7 +179,7 @@ async def test_install_upload_reports_validation_failure(tmp_path, monkeypatch):
     bad = staging / "broken.zip"
     bad.write_bytes(b"this is not a zip")
 
-    ok, reason = await plugin._install_upload(bad, "1")
+    ok, reason = await plugin._install_upload(bad, "1", PAKS_RECIPE)
     assert ok is False
     assert "zip" in reason.lower()
     assert (await plugin.list_mods("1"))["mods"] == []
@@ -156,8 +190,114 @@ async def test_install_upload_rejects_missing_game(tmp_path, monkeypatch):
     plugin, staging = _wired_plugin(main, tmp_path, monkeypatch)
     upload = _mod_zip(staging / "mod.zip")
 
-    ok, reason = await plugin._install_upload(upload, "999")
+    ok, reason = await plugin._install_upload(upload, "999", PAKS_RECIPE)
     assert (ok, reason) == (False, "game is not installed")
+
+
+async def test_install_upload_with_unknown_recipe_fails(tmp_path, monkeypatch):
+    main = _import_main(tmp_path)
+    plugin, staging = _wired_plugin(main, tmp_path, monkeypatch)
+    install = _ue_tree(tmp_path)
+    await plugin.add_game("1", "Stellar Blade", str(install))
+    upload = _mod_zip(staging / "mod.zip")
+
+    ok, reason = await plugin._install_upload(upload, "1", "custom-gone")
+    assert ok is False
+    assert "install method" in reason
+    assert (await plugin.list_mods("1"))["mods"] == []
+
+
+async def test_list_and_delete_recipes(tmp_path, monkeypatch):
+    main = _import_main(tmp_path)
+    plugin, _staging = _wired_plugin(main, tmp_path, monkeypatch)
+
+    builtins = {r["id"]: r for r in await plugin.list_recipes()}
+    assert builtins[PAKS_RECIPE]["builtin"] is True
+    assert builtins[PAKS_RECIPE]["name"] == "UE ~mods (pak)"
+    assert builtins[PAKS_RECIPE]["rules"] == 1
+
+    created = await plugin._create_recipe(
+        {
+            "name": "Movies folder",
+            "rules": [
+                {"match": ["*.mp4"], "anchor": "game_root", "subpath": "Movies"}
+            ],
+        }
+    )
+    assert created["builtin"] is False
+    assert created["name"] == "Movies folder"
+    assert created["id"]
+    listed = {r["id"]: r for r in await plugin.list_recipes()}
+    assert listed[created["id"]]["builtin"] is False
+
+    assert await plugin.delete_recipe(created["id"]) == {
+        "ok": True,
+        "error": None,
+    }
+    assert created["id"] not in {r["id"] for r in await plugin.list_recipes()}
+
+    refused = await plugin.delete_recipe(PAKS_RECIPE)
+    assert refused["ok"] is False
+    assert "built-in" in refused["error"]
+    assert PAKS_RECIPE in {r["id"] for r in await plugin.list_recipes()}
+
+
+async def test_create_recipe_rejects_invalid(tmp_path, monkeypatch):
+    main = _import_main(tmp_path)
+    plugin, _staging = _wired_plugin(main, tmp_path, monkeypatch)
+
+    # RecipeError is not a ValueError, so this only holds because the wrapper
+    # translates it — which is what makes the uploader answer 400, not 500.
+    with pytest.raises(ValueError):
+        await plugin._create_recipe({"name": ""})
+    assert len(await plugin.list_recipes()) == 4
+
+
+async def test_install_upload_multi_destination(tmp_path, monkeypatch):
+    """One upload, two anchors: paks land in ~mods, scripts under Win64."""
+    main = _import_main(tmp_path)
+    plugin, staging = _wired_plugin(main, tmp_path, monkeypatch)
+    install = _ue_tree(tmp_path)
+    await plugin.add_game("1", "Stellar Blade", str(install))
+
+    combo = await plugin._create_recipe(
+        {
+            "name": "Paks + UE4SS scripts",
+            "rules": [
+                {
+                    "match": ["*.pak", "*.utoc", "*.ucas"],
+                    "anchor": "paks_dir",
+                    "subpath": "~mods",
+                },
+                {
+                    "match": ["*.lua"],
+                    "anchor": "win64_dir",
+                    "subpath": "ue4ss/Mods",
+                    "mapping": "preserve_tree",
+                },
+            ],
+        }
+    )
+
+    upload = staging / "ComboMod.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        for ext in ("pak", "utoc", "ucas"):
+            zf.writestr(f"scarlet.{ext}", "x")
+        zf.writestr("MyMod/scripts/main.lua", "-- hi")
+
+    ok, detail = await plugin._install_upload(upload, "1", combo["id"])
+    assert (ok, detail) == (True, "ComboMod")
+
+    win64 = install / "SB" / "Binaries" / "Win64"
+    assert (win64 / "ue4ss/Mods/MyMod/scripts/main.lua").is_file()
+    assert (install / "SB/Content/Paks/~mods/scarlet.pak").is_file()
+    assert (await plugin.list_mods("1"))["mods"] == [
+        {
+            "name": "ComboMod",
+            "state": "enabled",
+            "recipe_name": "Paks + UE4SS scripts",
+        }
+    ]
 
 
 async def test_http_upload_installs_end_to_end(tmp_path, monkeypatch):
@@ -173,11 +313,19 @@ async def test_http_upload_installs_end_to_end(tmp_path, monkeypatch):
     await client.start_server()
     try:
         games = await (await client.get("/u/testtoken/games")).json()
-        assert games == {"games": [{"appid": "1", "name": "Stellar Blade"}]}
+        assert games["games"] == [
+            {"appid": "1", "name": "Stellar Blade", "anchors": ALL_ANCHORS}
+        ]
+        assert {
+            "id": PAKS_RECIPE,
+            "name": "UE ~mods (pak)",
+            "builtin": True,
+        } in games["recipes"]
 
         archive = _mod_zip(tmp_path / "ScarletHead.zip")
         form = aiohttp.FormData()
         form.add_field("appid", "1")
+        form.add_field("recipe", PAKS_RECIPE)
         form.add_field("file", archive.read_bytes(), filename="ScarletHead.zip")
         resp = await client.post("/u/testtoken", data=form)
         assert resp.status == 200
@@ -191,7 +339,11 @@ async def test_http_upload_installs_end_to_end(tmp_path, monkeypatch):
     mods_dir = install / "SB" / "Content" / "Paks" / "~mods"
     assert (mods_dir / "scarlet.pak").is_file()
     assert (await plugin.list_mods("1"))["mods"] == [
-        {"name": "ScarletHead", "state": "enabled"}
+        {
+            "name": "ScarletHead",
+            "state": "enabled",
+            "recipe_name": "UE ~mods (pak)",
+        }
     ]
 
 

@@ -11,6 +11,7 @@ import decky  # noqa: E402  (provided by Decky Loader)
 
 from moddock import importer  # noqa: E402
 from moddock.adapters.unreal import UEGameInfo, detect_ue_game  # noqa: E402
+from moddock.recipes import RecipeError, RecipeStore  # noqa: E402
 from moddock.settings import Settings  # noqa: E402
 from moddock.steam import (  # noqa: E402
     discover_libraries,
@@ -28,6 +29,7 @@ MIN_PORT, MAX_PORT = 1024, 65535
 class Plugin:
     settings: Settings
     store: ModStore
+    recipes: RecipeStore
     uploader: UploadServer | None = None
 
     # -- lifecycle -------------------------------------------------------
@@ -37,6 +39,7 @@ class Plugin:
             Path(decky.DECKY_PLUGIN_SETTINGS_DIR) / "settings.json"
         )
         self.store = ModStore(BASE_DIR)
+        self.recipes = RecipeStore(BASE_DIR / "recipes.json")
         STAGING_DIR.mkdir(parents=True, exist_ok=True)
         # Staging files are per-upload scratch; anything still here is debris
         # from an interrupted transfer in a previous session.
@@ -134,7 +137,16 @@ class Plugin:
         return {
             "installed": info is not None,
             "running_hint": False,
-            "mods": [{"name": m["name"], "state": m["state"]} for m in mods],
+            "mods": [
+                {
+                    "name": m["name"],
+                    "state": m["state"],
+                    # Which install method placed this mod; the panel shows it
+                    # so a mod's destinations are explainable after the fact.
+                    "recipe_name": m["recipe_name"],
+                }
+                for m in mods
+            ],
         }
 
     async def set_mod_enabled(
@@ -163,17 +175,73 @@ class Plugin:
         except StoreError as exc:
             return {"ok": False, "error": str(exc)}
 
+    # -- install methods (recipes) -------------------------------------------
+
+    async def list_recipes(self) -> list[dict]:
+        return [
+            {
+                "id": recipe.id,
+                "name": recipe.name,
+                "builtin": recipe.builtin,
+                # A count, not the rules themselves: the panel only needs to
+                # hint at how elaborate a method is.
+                "rules": len(recipe.rules),
+            }
+            for recipe in self.recipes.list()
+        ]
+
+    async def delete_recipe(self, recipe_id: str) -> dict:
+        try:
+            self.recipes.delete(recipe_id)
+            return {"ok": True, "error": None}
+        except RecipeError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    async def _recipes_payload(self) -> list[dict]:
+        """Install methods as the upload page's picker needs them."""
+        return [
+            {"id": recipe.id, "name": recipe.name, "builtin": recipe.builtin}
+            for recipe in self.recipes.list()
+        ]
+
+    async def _create_recipe(self, body: dict) -> dict:
+        """Create a custom install method from the upload page's JSON body."""
+        try:
+            recipe = self.recipes.create(body)
+        except RecipeError as exc:
+            # RecipeError is not a ValueError, and the uploader only turns a
+            # ValueError into a 400. Without this translation a malformed
+            # recipe would surface as a 500 with no reason for the user.
+            raise ValueError(str(exc)) from exc
+        return {"id": recipe.id, "name": recipe.name, "builtin": False}
+
     # -- upload install pipeline ---------------------------------------------
 
     async def _upload_games(self) -> list[dict]:
         """Games offered by the upload page: managed AND currently installed."""
-        return [
-            {"appid": game["appid"], "name": game["name"]}
-            for game in self.settings.managed_games
-            if self._detect(game["install_dir"]) is not None
-        ]
+        games = []
+        for game in self.settings.managed_games:
+            info = self._detect(game["install_dir"])
+            if info is None:
+                continue
+            games.append(
+                {
+                    "appid": game["appid"],
+                    "name": game["name"],
+                    # Anchors this install actually has, so the page can grey
+                    # out locations a rule could never resolve against.
+                    "anchors": [
+                        anchor
+                        for anchor, path in info.anchor_map().items()
+                        if path is not None
+                    ],
+                }
+            )
+        return games
 
-    async def _install_upload(self, path: Path, appid: str) -> tuple[bool, str]:
+    async def _install_upload(
+        self, path: Path, appid: str, recipe_id: str
+    ) -> tuple[bool, str]:
         """Validate, import and enable one uploaded file for the given game.
 
         Returns (ok, detail): the mod name on success, a user-facing reason on
@@ -183,9 +251,16 @@ class Plugin:
         info = self._detect(game["install_dir"]) if game else None
         if info is None:
             return False, "game is not installed"
+        recipe = self.recipes.get(recipe_id)
+        if recipe is None:
+            # The page was loaded before the method was deleted, or against a
+            # different plugin instance.
+            return False, "unknown install method — refresh the page"
         name = sanitize_mod_name(path.stem)
         try:
-            await self._off_loop(self.store.import_mod, appid, info, name, path)
+            await self._off_loop(
+                self.store.import_mod, appid, info, name, path, recipe=recipe
+            )
         except StoreError as exc:
             return False, str(exc)
         try:
@@ -207,6 +282,8 @@ class Plugin:
             port=self.settings.upload_port,
             installer=self._install_upload,
             games_provider=self._upload_games,
+            recipes_provider=self._recipes_payload,
+            recipe_creator=self._create_recipe,
             on_upload=notify,
         )
 
