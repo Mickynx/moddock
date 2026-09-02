@@ -32,11 +32,12 @@ Consequences of the copy model, all deliberate:
 
 from __future__ import annotations
 
+import filecmp
 import json
 import re
 import shutil
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .adapters.unreal import MODS_DIR_NAME, UEGameInfo
 from .importer import ImportProblem, ingest_tree
@@ -95,7 +96,27 @@ class ModStore:
     # -- deploy lists ------------------------------------------------------
 
     @staticmethod
-    def _entry_deploy(entry: dict, game: UEGameInfo | None) -> list[dict] | None:
+    def _check_destinations(mod_name: str, items: list[dict]) -> None:
+        """Reject destinations that do not stay inside the game root.
+
+        Every dst is joined onto the install dir by enable, disable and
+        delete, so a manifest that was hand-edited, half-written or corrupted
+        on disk could otherwise steer those operations at an arbitrary path.
+        The manifest is data read back from disk, not a trusted input: an
+        absolute, empty or `..`-bearing dst fails the whole entry.
+        """
+        for item in items:
+            dst = str(item.get("dst") or "").replace("\\", "/")
+            parts = PurePosixPath(dst).parts
+            if not dst or dst.startswith("/") or ".." in parts:
+                raise StoreError(
+                    f'manifest entry for "{mod_name}" is corrupted — delete '
+                    "the mod and import it again"
+                )
+
+    def _entry_deploy(
+        self, mod_name: str, entry: dict, game: UEGameInfo | None
+    ) -> list[dict] | None:
         """Deploy items for an entry; synthesizes them for legacy v1 entries.
 
         v1 manifests recorded a flat "files" list and always installed into
@@ -105,20 +126,25 @@ class ModStore:
         rollback to v1 keeps working. Without a detected game there are no
         anchors to resolve against, so such an entry is unusable (repo-side
         delete still works).
+
+        Raises StoreError for an entry whose destinations are not usable.
         """
         if "deploy" in entry:
-            return entry["deploy"]
-        if game is None or game.install_dir is None:
+            items = entry["deploy"]
+        elif game is None or game.install_dir is None:
             return None
-        paks_rel = game.anchor_map()["paks_dir"]
-        return [
-            {
-                "src": f,
-                "dst": f"{paks_rel}/{MODS_DIR_NAME}/{f}",
-                "overwrite": "refuse",
-            }
-            for f in entry["files"]
-        ]
+        else:
+            paks_rel = game.anchor_map()["paks_dir"]
+            items = [
+                {
+                    "src": f,
+                    "dst": f"{paks_rel}/{MODS_DIR_NAME}/{f}",
+                    "overwrite": "refuse",
+                }
+                for f in entry["files"]
+            ]
+        self._check_destinations(mod_name, items)
+        return items
 
     def _claimed(
         self, manifest: dict, game: UEGameInfo | None
@@ -132,7 +158,10 @@ class ModStore:
         """
         claimed: dict[str, str] = {}
         for name, entry in sorted(manifest["mods"].items()):
-            for item in self._entry_deploy(entry, game) or []:
+            # A corrupted entry aborts the import that is asking: its claims
+            # cannot be read, so no new mod can be proven collision-free
+            # against it. The message names the mod to delete.
+            for item in self._entry_deploy(name, entry, game) or []:
                 claimed[item["dst"].lower()] = name
         return claimed
 
@@ -235,7 +264,19 @@ class ModStore:
         manifest = self._load_manifest(appid)
         mods: list[dict] = []
         for name, entry in sorted(manifest["mods"].items()):
-            deploy = self._entry_deploy(entry, game)
+            try:
+                deploy = self._entry_deploy(name, entry, game)
+            except StoreError:
+                # One unusable entry must not blank the whole list: the mod is
+                # shown as it stands so the user can see it and delete it.
+                mods.append(
+                    {
+                        "name": name,
+                        "state": "disabled",
+                        "recipe_name": "corrupted entry",
+                    }
+                )
+                continue
             state = "disabled"
             if game is not None and game.install_dir is not None and deploy:
                 present = sum(
@@ -264,7 +305,7 @@ class ModStore:
         deploy = (
             None
             if game is None or game.install_dir is None
-            else self._entry_deploy(entry, game)
+            else self._entry_deploy(mod_name, entry, game)
         )
         if deploy is None:
             raise StoreError("game is not installed")
@@ -305,7 +346,7 @@ class ModStore:
             else:
                 changed = False
                 for item in deploy:
-                    changed |= self._recall(appid, game, item)
+                    changed |= self._recall(appid, game, repo, item)
             if changed and "deploy" in entry:
                 self._save_manifest(appid, manifest)
         except OSError as exc:
@@ -330,6 +371,16 @@ class ModStore:
 
         Returns whether the flag changed and the manifest needs saving.
         """
+        # A directory can be moved into the backup tree, but nothing that
+        # follows can cope with it: deployed-state, recall and delete all test
+        # the backup with is_file(), so the mod would be wedged — enable stuck
+        # at partial, disable a no-op, delete unable to unlink. Refuse before
+        # anything moves, while the game directory is still intact.
+        if dst_abs.is_dir():
+            raise StoreError(
+                f'"{item["dst"]}" is a directory in the game — this install '
+                "method cannot replace it"
+            )
         backup = self._backup_path(appid, item["dst"])
         if backup.exists():
             displaced = True
@@ -344,7 +395,9 @@ class ModStore:
         item["displaced"] = displaced
         return True
 
-    def _recall(self, appid: str, game: UEGameInfo, item: dict) -> bool:
+    def _recall(
+        self, appid: str, game: UEGameInfo, repo: Path, item: dict
+    ) -> bool:
         """Undo one deployed item: restore the backup, or just remove ours.
 
         The parked backup FILE is the first authority, ahead of the flag: the
@@ -354,9 +407,14 @@ class ModStore:
         flag is repaired on the way so the next recall knows.
 
         With no backup parked, the flag decides: an item that displaced
-        something has already had its original restored by an earlier recall
-        and must be left alone, while any other item's destination holds our
-        own copy and is unlinked.
+        something has normally had its original restored by an earlier recall
+        and must be left alone. That case is not always benign, though — the
+        backup may have been deleted by hand while our copy was still
+        deployed, which would strand our file in the game forever. The
+        destination's CONTENT settles it: byte-identical to the stored copy
+        means it is ours and goes; anything else is assumed to be the restored
+        original and stays. Any other item's destination holds our own copy
+        and is unlinked outright.
 
         Only the file itself is touched — directories are left in place
         because they are shared with the game and with other mods.
@@ -375,7 +433,14 @@ class ModStore:
                 item["displaced"] = True
                 return True
             if item.get("displaced"):
-                return False  # the original is already back; never unlink it
+                src = repo / item["src"]
+                if (
+                    dst_abs.is_file()
+                    and src.is_file()
+                    and filecmp.cmp(dst_abs, src, shallow=False)
+                ):
+                    dst_abs.unlink()  # our orphaned copy, not the original
+                return False
         dst_abs.unlink(missing_ok=True)
         return False
 
@@ -389,16 +454,32 @@ class ModStore:
         usable_game = (
             game if game is not None and game.install_dir is not None else None
         )
-        deploy = self._entry_deploy(entry, usable_game) or []
+        try:
+            deploy = self._entry_deploy(mod_name, entry, usable_game) or []
+        except StoreError:
+            # A corrupted entry names no destination anyone may act on, and
+            # delete is the only way out of it. Clean up what is unambiguously
+            # ours — the repository and the manifest entry — and touch nothing
+            # under the game or the backup tree.
+            deploy = []
         repo = self._mod_repo_dir(appid, mod_name)
         try:
             for item in deploy:
-                if usable_game is not None:
-                    self._recall(appid, usable_game, item)
-                # A backup can outlive the game it was taken from (the install
-                # dir may be gone, so the recall above could not put it back);
-                # nothing else will ever restore it, so it goes with the mod.
-                self._backup_path(appid, item["dst"]).unlink(missing_ok=True)
+                if usable_game is None:
+                    # No visible install dir: an unmounted SD card looks
+                    # exactly like an uninstalled game from here, and the
+                    # parked original may still be the only copy of a file the
+                    # game dir (invisible, not gone) still needs. Leaving a
+                    # stale backup behind is the cheap mistake; deleting a live
+                    # one is not.
+                    continue
+                self._recall(appid, usable_game, repo, item)
+                # Whatever the recall did not put back is debris: the original
+                # is either restored or was never the game's. Nothing will ever
+                # restore it now, so it goes with the mod.
+                backup = self._backup_path(appid, item["dst"])
+                if backup.is_file():
+                    backup.unlink()
             shutil.rmtree(repo, ignore_errors=True)
             del manifest["mods"][mod_name]
             self._save_manifest(appid, manifest)

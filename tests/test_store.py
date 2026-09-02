@@ -12,8 +12,8 @@ from moddock.store import ModStore, StoreError, sanitize_mod_name
 PAK_RECIPE = BUILTIN_RECIPES[0]  # ue-paks-mods
 
 
-def _game(tmp_path: Path) -> UEGameInfo:
-    install = tmp_path / "game"
+def _game(tmp_path: Path, sub: str = "game") -> UEGameInfo:
+    install = tmp_path / sub
     (install / "Engine").mkdir(parents=True)
     paks = install / "SB" / "Content" / "Paks"
     paks.mkdir(parents=True)
@@ -387,6 +387,119 @@ def test_uninstall_then_reinstall_keeps_mods_disabled(tmp_path):
     assert store.list_mods("1", reinstalled)[0]["state"] == "disabled"
     store.set_enabled("1", reinstalled, "Scarlet", True)
     assert store.list_mods("1", reinstalled)[0]["state"] == "enabled"
+
+
+def test_delete_without_game_keeps_a_parked_backup(tmp_path):
+    """An offline library must not cost the user the original file.
+
+    `game is None` means "the install dir is not visible" — an unmounted SD
+    card as much as an uninstalled game. Reaping the parked backup there would
+    destroy the game's own file while our copy still sits in the (currently
+    invisible) game directory, leaving nothing to restore.
+    """
+    store, game, original, backup = _replacer(tmp_path)
+    store.set_enabled("1", game, "Replacer", True)
+    assert backup.read_bytes() == b"vanilla"
+
+    store.delete_mod("1", None, "Replacer")
+    assert backup.read_bytes() == b"vanilla"  # the parked original survives
+    assert store.list_mods("1", None) == []
+    assert not (tmp_path / "base" / "mods" / "1" / "Replacer").exists()
+
+
+def test_backup_item_refuses_a_destination_that_is_a_directory(tmp_path):
+    """A directory at the destination cannot be parked as a backup.
+
+    Everything downstream (deployed-state, recall, delete) tests the backup
+    with `is_file()`, so moving a directory there would wedge the mod: enable
+    reports partial forever, disable no-ops, delete cannot unlink it. The
+    honest failure is at enable, before anything moves.
+    """
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    target = game.install_dir / "SB" / "original.dll"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_bytes(b"inside")
+    store.import_mod("1", game, "Replacer", _dll_archive(tmp_path),
+                     _backup_recipe())
+
+    with pytest.raises(StoreError) as excinfo:
+        store.set_enabled("1", game, "Replacer", True)
+    assert "directory" in str(excinfo.value)
+    assert (target / "keep.txt").read_bytes() == b"inside"
+    assert not (tmp_path / "base" / "backup" / "1" / "SB").exists()
+
+
+def test_disable_removes_our_copy_when_the_backup_was_lost(tmp_path):
+    """With the backup gone, byte-identity to the repository identifies ours.
+
+    A hand-cleared backup tree leaves the flag saying "displaced" with no
+    original to restore. The destination then holds either our copy or a file
+    the user put back; comparing it with the stored copy tells them apart.
+    """
+    store, game, original, backup = _replacer(tmp_path)
+    store.set_enabled("1", game, "Replacer", True)
+    backup.unlink()
+
+    store.set_enabled("1", game, "Replacer", False)
+    assert not original.exists()
+
+
+def test_disable_leaves_a_foreign_file_when_the_backup_was_lost(tmp_path):
+    store, game, original, backup = _replacer(tmp_path)
+    store.set_enabled("1", game, "Replacer", True)
+    backup.unlink()
+    original.write_bytes(b"restored by hand")
+
+    store.set_enabled("1", game, "Replacer", False)
+    assert original.read_bytes() == b"restored by hand"
+
+
+def _corrupted(tmp_path, dst: str = "../../evil"):
+    """Store + game with a hand-written manifest entry holding a bad dst."""
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path, "lib/steamapps/common/Game")
+    repo = tmp_path / "base" / "mods" / "1" / "Evil"
+    repo.mkdir(parents=True)
+    (repo / "evil.pak").write_bytes(b"x")
+    (tmp_path / "base" / "manifest").mkdir(parents=True)
+    (tmp_path / "base" / "manifest" / "1.json").write_text(json.dumps({
+        "mods": {"Evil": {
+            "recipe": "hand", "recipe_name": "Handmade",
+            "deploy": [{"src": "evil.pak", "dst": dst, "overwrite": "refuse"}],
+            "source": "e.zip", "imported_at": "2026-09-02T00:00:00+00:00",
+        }}
+    }))
+    return store, game, repo
+
+
+def test_corrupted_manifest_entry_is_listed_as_corrupted(tmp_path):
+    """A dst read back from disk is not trusted: it escapes the game root."""
+    store, game, _repo = _corrupted(tmp_path)
+    assert store.list_mods("1", game) == [
+        {"name": "Evil", "state": "disabled", "recipe_name": "corrupted entry"}
+    ]
+
+
+def test_corrupted_manifest_entry_cannot_be_enabled(tmp_path):
+    store, game, _repo = _corrupted(tmp_path)
+    with pytest.raises(StoreError) as excinfo:
+        store.set_enabled("1", game, "Evil", True)
+    assert "Evil" in str(excinfo.value)
+    assert "corrupted" in str(excinfo.value)
+
+
+def test_corrupted_manifest_entry_deletes_repo_and_entry_only(tmp_path):
+    """Delete must stay possible — that is how the user gets rid of it."""
+    store, game, repo = _corrupted(tmp_path)
+    outside = (game.install_dir / "../../evil").resolve()
+    outside.write_bytes(b"someone else's file")
+
+    store.delete_mod("1", game, "Evil")
+    assert outside.read_bytes() == b"someone else's file"
+    assert store.list_mods("1", game) == []
+    assert not repo.exists()
+    assert not (tmp_path / "base" / "backup").exists()
 
 
 def test_delete_without_game_cleans_repository(tmp_path):
