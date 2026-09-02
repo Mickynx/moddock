@@ -37,45 +37,79 @@ class InstallerSpy:
     """Records installer calls; per-name results can be preloaded."""
 
     def __init__(self):
-        self.calls: list[tuple[Path, str, bytes]] = []
+        self.calls: list[tuple[Path, str, str, bytes]] = []
         self.result: tuple[bool, str] = (True, "Some Mod")
 
-    async def __call__(self, path: Path, appid: str) -> tuple[bool, str]:
+    async def __call__(
+        self, path: Path, appid: str, recipe_id: str
+    ) -> tuple[bool, str]:
         # Content is captured because the staging file is discarded afterwards.
-        self.calls.append((path, appid, path.read_bytes()))
+        self.calls.append((path, appid, recipe_id, path.read_bytes()))
         return self.result
+
+
+class RecipeCreatorSpy:
+    """Records creation bodies; "bad" names raise like a rejected recipe."""
+
+    def __init__(self):
+        self.bodies: list[dict] = []
+
+    async def __call__(self, body: dict) -> dict:
+        self.bodies.append(body)
+        if body.get("name") == "bad":
+            raise ValueError("bad recipe")
+        return {"id": "custom-ab", "name": body["name"], "builtin": False}
 
 
 @pytest.fixture
 async def client_and_server(tmp_path):
     installer = InstallerSpy()
+    creator = RecipeCreatorSpy()
 
     async def games():
-        return [{"appid": "42", "name": "Stellar Blade"}]
+        return [
+            {
+                "appid": "42",
+                "name": "Stellar Blade",
+                "anchors": ["game_root", "paks_dir"],
+            }
+        ]
+
+    async def recipes():
+        return [{"id": "ue-paks-mods", "name": "UE ~mods (pak)", "builtin": True}]
 
     server = UploadServer(
         staging=tmp_path / "staging",
         port=0,
         installer=installer,
         games_provider=games,
+        recipes_provider=recipes,
+        recipe_creator=creator,
     )
     server.token = "testtoken"
     client = TestClient(TestServer(server.build_app()))
     await client.start_server()
-    yield client, installer, tmp_path / "staging"
+    yield client, installer, tmp_path / "staging", creator
     await client.close()
 
 
-def _form(filename: str, content: bytes = b"data", appid: str | None = "42"):
+def _form(
+    filename: str,
+    content: bytes = b"data",
+    appid: str | None = "42",
+    recipe: str | None = "ue-paks-mods",
+):
     form = aiohttp.FormData()
     if appid is not None:
         form.add_field("appid", appid)
+    if recipe is not None:
+        form.add_field("recipe", recipe)
     form.add_field("file", content, filename=filename)
     return form
 
 
 async def test_get_upload_page(client_and_server):
-    client, _, _ = client_and_server
+    client, _, _, _ = client_and_server
     resp = await client.get("/u/testtoken")
     assert resp.status == 200
     text = await resp.text()
@@ -84,37 +118,48 @@ async def test_get_upload_page(client_and_server):
 
 
 async def test_games_endpoint(client_and_server):
-    client, _, _ = client_and_server
+    client, _, _, _ = client_and_server
     resp = await client.get("/u/testtoken/games")
     assert resp.status == 200
-    assert (await resp.json())["games"] == [
-        {"appid": "42", "name": "Stellar Blade"}
-    ]
+    assert await resp.json() == {
+        "games": [
+            {
+                "appid": "42",
+                "name": "Stellar Blade",
+                "anchors": ["game_root", "paks_dir"],
+            }
+        ],
+        "recipes": [
+            {"id": "ue-paks-mods", "name": "UE ~mods (pak)", "builtin": True}
+        ],
+    }
 
 
 async def test_wrong_token_404(client_and_server):
-    client, _, _ = client_and_server
+    client, _, _, _ = client_and_server
     assert (await client.get("/u/wrong")).status == 404
     assert (await client.get("/u/wrong/games")).status == 404
     assert (await client.post("/u/wrong")).status == 404
+    assert (await client.post("/u/wrong/recipes", json={"name": "x"})).status == 404
 
 
 async def test_upload_installs_file(client_and_server):
-    client, installer, staging = client_and_server
+    client, installer, staging, _ = client_and_server
     resp = await client.post("/u/testtoken", data=_form("mod.pak", b"pakdata"))
     assert resp.status == 200
     body = await resp.json()
     assert body["installed"] == [{"name": "mod.pak", "mod": "Some Mod"}]
     assert body["failed"] == []
-    [(path, appid, content)] = installer.calls
+    [(path, appid, recipe_id, content)] = installer.calls
     assert appid == "42"
+    assert recipe_id == "ue-paks-mods"
     assert content == b"pakdata"
     # The staging copy is consumed: nothing is left behind.
     assert list(staging.iterdir()) == []
 
 
 async def test_upload_without_game_fails(client_and_server):
-    client, installer, _ = client_and_server
+    client, installer, _, _ = client_and_server
     resp = await client.post("/u/testtoken", data=_form("mod.pak", appid=None))
     body = await resp.json()
     assert body["installed"] == []
@@ -122,8 +167,68 @@ async def test_upload_without_game_fails(client_and_server):
     assert installer.calls == []
 
 
+async def test_upload_without_recipe_fails(client_and_server):
+    client, installer, _, _ = client_and_server
+    resp = await client.post("/u/testtoken", data=_form("mod.pak", recipe=None))
+    body = await resp.json()
+    assert body["installed"] == []
+    assert body["failed"] == [
+        {"name": "mod.pak", "reason": "no install method selected"}
+    ]
+    assert installer.calls == []
+
+
+async def test_create_recipe_endpoint(client_and_server):
+    client, _, _, creator = client_and_server
+    payload = {
+        "name": "My",
+        "rules": [{"match": ["*.pak"], "anchor": "paks_dir", "subpath": "~mods"}],
+        "leftover": "ignore",
+    }
+    resp = await client.post("/u/testtoken/recipes", json=payload)
+    assert resp.status == 200
+    assert await resp.json() == {
+        "id": "custom-ab",
+        "name": "My",
+        "builtin": False,
+    }
+    assert creator.bodies == [payload]
+
+    resp = await client.post("/u/testtoken/recipes", json={"name": "bad"})
+    assert resp.status == 400
+    assert await resp.json() == {"error": "bad recipe"}
+
+    resp = await client.post("/u/wrong/recipes", json=payload)
+    assert resp.status == 404
+
+
+async def test_create_recipe_rejects_malformed_json(client_and_server):
+    client, _, _, creator = client_and_server
+    resp = await client.post(
+        "/u/testtoken/recipes",
+        data=b"{not json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status == 400
+    assert await resp.json() == {"error": "invalid JSON"}
+    assert creator.bodies == []
+
+
+async def test_create_recipe_without_creator_is_400(tmp_path):
+    server = UploadServer(staging=tmp_path / "staging", port=0)
+    server.token = "testtoken"
+    client = TestClient(TestServer(server.build_app()))
+    await client.start_server()
+    try:
+        resp = await client.post("/u/testtoken/recipes", json={"name": "My"})
+        assert resp.status == 400
+        assert "error" in await resp.json()
+    finally:
+        await client.close()
+
+
 async def test_failed_install_reports_reason(client_and_server):
-    client, installer, staging = client_and_server
+    client, installer, staging, _ = client_and_server
     installer.result = (False, 'a mod named "Some Mod" already exists')
     resp = await client.post("/u/testtoken", data=_form("mod.zip"))
     body = await resp.json()
@@ -135,7 +240,7 @@ async def test_failed_install_reports_reason(client_and_server):
 
 
 async def test_crashing_installer_reports_not_500(tmp_path):
-    async def boom(path: Path, appid: str) -> tuple[bool, str]:
+    async def boom(path: Path, appid: str, recipe_id: str) -> tuple[bool, str]:
         raise RuntimeError("importer exploded")
 
     staging = tmp_path / "staging"
@@ -154,7 +259,7 @@ async def test_crashing_installer_reports_not_500(tmp_path):
 
 
 async def test_upload_rejects_bad_extension(client_and_server):
-    client, installer, staging = client_and_server
+    client, installer, staging, _ = client_and_server
     resp = await client.post(
         "/u/testtoken", data=_form("virus.exe", b"MZ")
     )
@@ -166,7 +271,7 @@ async def test_upload_rejects_bad_extension(client_and_server):
 
 
 async def test_same_name_uploaded_twice_processes_both(client_and_server):
-    client, installer, _ = client_and_server
+    client, installer, _, _ = client_and_server
     for _ in range(2):
         resp = await client.post("/u/testtoken", data=_form("mod.zip"))
         assert (await resp.json())["installed"]
@@ -188,7 +293,7 @@ def test_sanitize_filename_rejects_traversal_segments():
 
 
 async def test_overlong_filename_is_clamped_not_500(client_and_server):
-    client, installer, _ = client_and_server
+    client, installer, _, _ = client_and_server
     resp = await client.post(
         "/u/testtoken", data=_form("y" * 400 + ".zip")
     )
@@ -199,7 +304,7 @@ async def test_overlong_filename_is_clamped_not_500(client_and_server):
 
 
 async def test_traversal_upload_stays_inside_staging(client_and_server):
-    client, installer, staging = client_and_server
+    client, installer, staging, _ = client_and_server
     resp = await client.post(
         "/u/testtoken", data=_form("../../pwned.zip")
     )

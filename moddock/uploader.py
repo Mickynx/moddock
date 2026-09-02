@@ -1,11 +1,13 @@
 """LAN web-upload service.
 
 Serves a single mobile-friendly upload page behind a random URL token.
-The page requires picking a target game up front; each uploaded file is
-streamed to a staging directory, handed to the installer callback
-(validate → import → enable, provided by main.py), and the staging copy
-is discarded — success or failure is reported straight back to the
-browser. Off by default; main.py starts/stops it from the panel toggle.
+The page requires picking a target game *and* an install method (recipe)
+up front; each uploaded file is streamed to a staging directory, handed
+to the installer callback (validate → import → enable, provided by
+main.py), and the staging copy is discarded — success or failure is
+reported straight back to the browser. The page can also create a custom
+install method inline, which it POSTs to the recipes endpoint. Off by
+default; main.py starts/stops it from the panel toggle.
 """
 
 from __future__ import annotations
@@ -37,12 +39,19 @@ body{font-family:system-ui,sans-serif;background:#0f141b;color:#e6ebf0;
      display:flex;flex-direction:column;align-items:center;padding:2rem 1rem}
 h1{font-size:1.3rem}
 label{margin:.4rem 0}
-select{background:#1d2733;color:#e6ebf0;border:1px solid #33404f;
+select,input[type=text]{background:#1d2733;color:#e6ebf0;border:1px solid #33404f;
        border-radius:6px;padding:.5rem;font-size:1rem;max-width:90vw}
 input[type=file]{margin:1rem 0;max-width:90vw}
 button{background:#3a9bed;border:0;color:#fff;padding:.7rem 2rem;
        border-radius:8px;font-size:1rem}
 button:disabled{opacity:.5}
+button.small{background:#2b3947;padding:.4rem 1rem;font-size:.85rem}
+#newform{display:none;width:min(28rem,90vw);background:#151d27;
+         border:1px solid #33404f;border-radius:8px;padding:.8rem;margin:.6rem 0}
+#newform .title{font-weight:600;margin-bottom:.4rem}
+.field{display:flex;flex-direction:column;gap:.2rem;margin:.4rem 0;font-size:.85rem}
+.field span{opacity:.75}
+.rule{border:1px solid #2b3947;border-radius:6px;padding:.5rem;margin:.5rem 0}
 #items{width:min(28rem,90vw);margin-top:1rem}
 .item{margin:.6rem 0;font-size:.9rem}
 .name{word-break:break-all}
@@ -54,34 +63,160 @@ button:disabled{opacity:.5}
 </style></head><body>
 <h1>ModDock — upload mods</h1>
 <label>Install to <select id="g"></select></label>
+<label>Install method <select id="r"></select></label>
+<div id="newform"></div>
 <p id="hint">Accepted: .zip .7z .pak — mods install and enable immediately.</p>
 <input id="f" type="file" multiple>
 <button id="btn" onclick="up()">Upload &amp; install</button>
 <div id="items"></div>
 <script>
 const sel=document.getElementById('g');
+const rsel=document.getElementById('r');
+const form=document.getElementById('newform');
 const btn=document.getElementById('btn');
 const items=document.getElementById('items');
 const hint=document.getElementById('hint');
+// Sentinel option value: picking it opens the inline creation form instead
+// of naming a recipe, so it is never sent with an upload.
+const NEW='__new';
+const DEFAULT_RECIPE='ue-paks-mods';
+const ANCHORS=['game_root','paks_dir','win64_dir'];
+const MAPPINGS=['flatten','preserve_tree'];
+const OVERWRITES=['refuse','backup'];
+const LEFTOVERS=['ignore','fail'];
+function option(value,text){
+  const o=document.createElement('option');
+  o.value=value; o.textContent=text;
+  return o;
+}
+function picker(values,initial){
+  const s=document.createElement('select');
+  for(const v of values) s.appendChild(option(v,v));
+  s.value=initial;
+  return s;
+}
+function textInput(placeholder){
+  const i=document.createElement('input');
+  i.type='text'; i.placeholder=placeholder;
+  return i;
+}
+function field(text,control){
+  const l=document.createElement('label'); l.className='field';
+  const s=document.createElement('span'); s.textContent=text;
+  l.append(s,control);
+  return l;
+}
 async function loadGames(){
   try{
     const r=await fetch(location.pathname+'/games');
     const j=await r.json();
+    sel.textContent=''; rsel.textContent='';
     if(!j.games.length){
       btn.disabled=true;
       hint.textContent='No installed games are managed yet — use Add Game in the ModDock panel first.';
       return;
     }
-    for(const g of j.games){
-      const o=document.createElement('option');
-      o.value=g.appid; o.textContent=g.name;
-      sel.appendChild(o);
-    }
+    for(const g of j.games) sel.appendChild(option(g.appid,g.name));
     const last=localStorage.getItem('moddock_appid');
     if(last && [...sel.options].some(o=>o.value===last)) sel.value=last;
+    for(const rc of (j.recipes||[])) rsel.appendChild(option(rc.id,rc.name));
+    rsel.appendChild(option(NEW,'+ New install method…'));
+    restoreRecipe();
+    btn.disabled=false;
   }catch(e){
     btn.disabled=true;
     hint.textContent='Could not load the game list — reopen this page from the panel QR code.';
+  }
+}
+function restoreRecipe(){
+  // Each game remembers its own install method; an id that no longer exists
+  // (recipe deleted since) falls back to the built-in default.
+  const want=localStorage.getItem('moddock_recipe_'+sel.value)||DEFAULT_RECIPE;
+  const usable=[...rsel.options].filter(o=>o.value!==NEW);
+  if(usable.some(o=>o.value===want)) rsel.value=want;
+  else if(usable.length) rsel.value=usable[0].value;
+  toggleForm();
+}
+function toggleForm(){
+  form.style.display=(rsel.value===NEW)?'block':'none';
+}
+sel.onchange=restoreRecipe;
+rsel.onchange=toggleForm;
+const nameInput=textInput('Name (e.g. Movies folder)');
+const rulesBox=document.createElement('div');
+const leftoverSel=picker(LEFTOVERS,'ignore');
+const saveBtn=document.createElement('button');
+const ruleFields=new WeakMap();
+function addRule(){
+  const ruleRow=document.createElement('div'); ruleRow.className='rule';
+  const match=textInput('*.pak, *.utoc, *.ucas');
+  const anchor=picker(ANCHORS,'paks_dir');
+  const subpath=textInput('subfolder (optional)');
+  const mapping=picker(MAPPINGS,'flatten');
+  const overwrite=picker(OVERWRITES,'refuse');
+  const del=document.createElement('button');
+  del.type='button'; del.className='small'; del.textContent='Remove rule';
+  del.onclick=()=>ruleRow.remove();
+  ruleRow.append(
+    field('Files matching (comma separated)',match),
+    field('Install under',anchor),
+    field('Subfolder',subpath),
+    field('Layout',mapping),
+    field('If the file exists',overwrite),
+    del);
+  ruleFields.set(ruleRow,{match,anchor,subpath,mapping,overwrite});
+  rulesBox.appendChild(ruleRow);
+}
+function buildForm(){
+  const title=document.createElement('div');
+  title.className='title'; title.textContent='New install method';
+  const addBtn=document.createElement('button');
+  addBtn.type='button'; addBtn.className='small'; addBtn.textContent='+ Add rule';
+  addBtn.onclick=addRule;
+  saveBtn.type='button'; saveBtn.textContent='Save install method';
+  saveBtn.onclick=saveRecipe;
+  form.append(title,field('Name',nameInput),rulesBox,addBtn,
+              field('Files no rule matches',leftoverSel),saveBtn);
+  addRule();
+}
+async function saveRecipe(){
+  const rules=[];
+  for(const ruleRow of rulesBox.children){
+    const f=ruleFields.get(ruleRow);
+    if(!f) continue;
+    rules.push({
+      match:f.match.value.split(',').map(s=>s.trim()).filter(Boolean),
+      anchor:f.anchor.value,
+      subpath:f.subpath.value.trim(),
+      mapping:f.mapping.value,
+      overwrite:f.overwrite.value,
+    });
+  }
+  const payload={name:nameInput.value.trim(),rules:rules,leftover:leftoverSel.value};
+  saveBtn.disabled=true;
+  try{
+    const r=await fetch(location.pathname+'/recipes',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload),
+    });
+    let j=null; try{ j=await r.json(); }catch(e){}
+    if(!r.ok || !j || !j.id){
+      hint.textContent=(j&&j.error)||'Could not save this install method.';
+      return;
+    }
+    // Remember both before reloading, so the refreshed lists come back on the
+    // same game with the freshly created method selected.
+    localStorage.setItem('moddock_appid',sel.value);
+    localStorage.setItem('moddock_recipe_'+sel.value,j.id);
+    await loadGames();
+    if([...rsel.options].some(o=>o.value===j.id)) rsel.value=j.id;
+    toggleForm();
+    hint.textContent='Saved install method "'+j.name+'".';
+  }catch(e){
+    hint.textContent='Could not save this install method.';
+  }finally{
+    saveBtn.disabled=false;
   }
 }
 function row(name){
@@ -97,10 +232,13 @@ function row(name){
                   status.textContent=msg; status.className=ok?'ok':'bad'; },
   };
 }
-function sendOne(file,appid,ui){
+function sendOne(file,appid,recipe,ui){
   return new Promise(resolve=>{
     const fd=new FormData();
+    // Both selections must precede the file part: the server streams parts
+    // in order and refuses a file it cannot route yet.
     fd.append('appid',appid);
+    fd.append('recipe',recipe);
     fd.append('file',file,file.name);
     const x=new XMLHttpRequest();
     x.open('POST',location.pathname);
@@ -122,12 +260,19 @@ async function up(){
   if(!files.length){ hint.textContent='Pick one or more files first.'; return; }
   const appid=sel.value;
   if(!appid){ hint.textContent='Pick a game first.'; return; }
+  const recipe=rsel.value;
+  if(!recipe || recipe===NEW){
+    hint.textContent='Pick an install method first — or save the new one you are creating.';
+    return;
+  }
   localStorage.setItem('moddock_appid',appid);
+  localStorage.setItem('moddock_recipe_'+appid,recipe);
   btn.disabled=true;
   items.textContent='';
-  for(const f of files){ await sendOne(f,appid,row(f.name)); }
+  for(const f of files){ await sendOne(f,appid,recipe,row(f.name)); }
   btn.disabled=false;
 }
+buildForm();
 loadGames();
 </script></body></html>"""
 
@@ -206,10 +351,15 @@ def _unique_path(directory: Path, name: str) -> Path:
     return candidate
 
 
-# The installer receives (staged file, appid) and returns (ok, detail):
-# the imported mod's name on success, a user-facing reason on failure.
-Installer = Callable[[Path, str], Awaitable[tuple[bool, str]]]
+# The installer receives (staged file, appid, recipe id) and returns
+# (ok, detail): the imported mod's name on success, a user-facing reason on
+# failure.
+Installer = Callable[[Path, str, str], Awaitable[tuple[bool, str]]]
 GamesProvider = Callable[[], Awaitable[list[dict]]]
+RecipesProvider = Callable[[], Awaitable[list[dict]]]
+# Receives the page's raw JSON body and returns the created recipe as a dict;
+# a ValueError carries a user-facing rejection reason.
+RecipeCreator = Callable[[dict], Awaitable[dict]]
 
 
 class UploadServer:
@@ -220,6 +370,8 @@ class UploadServer:
         installer: Installer | None = None,
         games_provider: GamesProvider | None = None,
         on_upload: Callable[[str], Awaitable[None]] | None = None,
+        recipes_provider: RecipesProvider | None = None,
+        recipe_creator: RecipeCreator | None = None,
         host: str = "0.0.0.0",
     ):
         self.staging = staging
@@ -227,6 +379,8 @@ class UploadServer:
         self.installer = installer
         self.games_provider = games_provider
         self.on_upload = on_upload
+        self.recipes_provider = recipes_provider
+        self.recipe_creator = recipe_creator
         self.host = host
         self.token: str | None = None
         self._runner: web.AppRunner | None = None
@@ -236,6 +390,7 @@ class UploadServer:
         app.router.add_get("/u/{token}", self._page)
         app.router.add_get("/u/{token}/games", self._games)
         app.router.add_post("/u/{token}", self._upload)
+        app.router.add_post("/u/{token}/recipes", self._create_recipe)
         return app
 
     def _check_token(self, request: web.Request) -> None:
@@ -249,13 +404,37 @@ class UploadServer:
     async def _games(self, request: web.Request) -> web.Response:
         self._check_token(request)
         games = await self.games_provider() if self.games_provider else []
-        return web.json_response({"games": games})
+        recipes = await self.recipes_provider() if self.recipes_provider else []
+        return web.json_response({"games": games, "recipes": recipes})
+
+    async def _create_recipe(self, request: web.Request) -> web.Response:
+        self._check_token(request)
+        try:
+            body = await request.json()
+        except ValueError:
+            # json.JSONDecodeError and UnicodeDecodeError are both ValueErrors.
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        if self.recipe_creator is None:
+            return web.json_response(
+                {"error": "install methods cannot be created right now"},
+                status=400,
+            )
+        try:
+            result = await self.recipe_creator(body)
+        except ValueError as exc:
+            # A rejected recipe is user error, not a server fault: the page
+            # shows str(exc) verbatim.
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(result)
 
     async def _upload(self, request: web.Request) -> web.Response:
         self._check_token(request)
         installed: list[dict] = []
         failed: list[dict] = []
         appid: str | None = None
+        recipe_id: str | None = None
         self.staging.mkdir(parents=True, exist_ok=True)
         reader = await request.multipart()
         while True:
@@ -264,6 +443,9 @@ class UploadServer:
                 break
             if part.name == "appid" and not part.filename:
                 appid = (await part.text()).strip() or None
+                continue
+            if part.name == "recipe" and not part.filename:
+                recipe_id = (await part.text()).strip() or None
                 continue
             raw_name = part.filename or ""
             name = sanitize_filename(raw_name)
@@ -279,6 +461,13 @@ class UploadServer:
                 # The page always sends the appid field before the files;
                 # anything else is a malformed client.
                 failed.append({"name": name, "reason": "no game selected"})
+                continue
+            if recipe_id is None:
+                # Likewise for the install method: without one there is no way
+                # to know where the file belongs.
+                failed.append(
+                    {"name": name, "reason": "no install method selected"}
+                )
                 continue
             target = _unique_path(self.staging, name)
             # Stream to a staging name and rename on success, so a truncated
@@ -321,7 +510,7 @@ class UploadServer:
             # it needs into the mod store, and a failed install has nothing to
             # keep.
             try:
-                ok, detail = await self.installer(target, appid)
+                ok, detail = await self.installer(target, appid, recipe_id)
             except Exception as exc:  # noqa: BLE001 - report, don't 500
                 ok, detail = False, f"install failed: {exc}"
             finally:
