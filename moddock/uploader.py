@@ -13,6 +13,7 @@ default; main.py starts/stops it from the panel toggle.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import secrets
@@ -24,6 +25,9 @@ from aiohttp import web
 
 ALLOWED_UPLOAD_EXTS = {".zip", ".7z", ".pak", ".utoc", ".ucas"}
 MAX_FILE_SIZE = 2 * 1024**3  # 2 GiB per file
+# A recipe body is buffered in memory, so it gets its own (much smaller) cap
+# than the streamed-to-disk uploads the app-wide client_max_size is sized for.
+RECIPE_BODY_LIMIT = 256 * 1024
 # Well under the 255-byte per-component limit of ext4/btrfs, leaving room for
 # the " (n)" collision suffix and the ".part" staging suffix.
 MAX_FILENAME_LEN = 200
@@ -84,6 +88,8 @@ const ANCHORS=['game_root','paks_dir','win64_dir'];
 const MAPPINGS=['flatten','preserve_tree'];
 const OVERWRITES=['refuse','backup'];
 const LEFTOVERS=['ignore','fail'];
+// The games payload, kept so a rule row can grey out anchors this game lacks.
+let games=[];
 function option(value,text){
   const o=document.createElement('option');
   o.value=value; o.textContent=text;
@@ -116,12 +122,13 @@ async function loadGames(){
       hint.textContent='No installed games are managed yet — use Add Game in the ModDock panel first.';
       return;
     }
+    games=j.games;
     for(const g of j.games) sel.appendChild(option(g.appid,g.name));
     const last=localStorage.getItem('moddock_appid');
     if(last && [...sel.options].some(o=>o.value===last)) sel.value=last;
     for(const rc of (j.recipes||[])) rsel.appendChild(option(rc.id,rc.name));
     rsel.appendChild(option(NEW,'+ New install method…'));
-    restoreRecipe();
+    onGameChange();
     btn.disabled=false;
   }catch(e){
     btn.disabled=true;
@@ -140,7 +147,34 @@ function restoreRecipe(){
 function toggleForm(){
   form.style.display=(rsel.value===NEW)?'block':'none';
 }
-sel.onchange=restoreRecipe;
+function gameAnchors(){
+  // null means "unknown" — an older server that sends no anchors must not grey
+  // out every choice.
+  const g=games.find(x=>String(x.appid)===String(sel.value));
+  return (g && Array.isArray(g.anchors) && g.anchors.length) ? g.anchors : null;
+}
+function syncAnchor(anchorSel){
+  const allowed=gameAnchors();
+  for(const o of anchorSel.options) o.disabled=allowed?!allowed.includes(o.value):false;
+  // A pick this game cannot honour would only fail at upload time, so move it
+  // to the first location the game does have.
+  const current=[...anchorSel.options].find(o=>o.value===anchorSel.value);
+  if(current && current.disabled){
+    const usable=[...anchorSel.options].find(o=>!o.disabled);
+    if(usable) anchorSel.value=usable.value;
+  }
+}
+function syncAnchors(){
+  for(const ruleRow of rulesBox.children){
+    const f=ruleFields.get(ruleRow);
+    if(f) syncAnchor(f.anchor);
+  }
+}
+function onGameChange(){
+  restoreRecipe();
+  syncAnchors();
+}
+sel.onchange=onGameChange;
 rsel.onchange=toggleForm;
 const nameInput=textInput('Name (e.g. Movies folder)');
 const rulesBox=document.createElement('div');
@@ -151,6 +185,7 @@ function addRule(){
   const ruleRow=document.createElement('div'); ruleRow.className='rule';
   const match=textInput('*.pak, *.utoc, *.ucas');
   const anchor=picker(ANCHORS,'paks_dir');
+  syncAnchor(anchor);
   const subpath=textInput('subfolder (optional)');
   const mapping=picker(MAPPINGS,'flatten');
   const overwrite=picker(OVERWRITES,'refuse');
@@ -407,10 +442,29 @@ class UploadServer:
         recipes = await self.recipes_provider() if self.recipes_provider else []
         return web.json_response({"games": games, "recipes": recipes})
 
+    @staticmethod
+    async def _read_capped(request: web.Request, limit: int) -> bytes | None:
+        """Body bytes, or None when the client sent more than `limit`.
+
+        Content-Length is not consulted: a chunked request declares none. A
+        single StreamReader.read() can also come back short, so keep reading
+        until the cap is passed or the body ends.
+        """
+        raw = b""
+        while len(raw) <= limit:
+            chunk = await request.content.read(limit + 1 - len(raw))
+            if not chunk:
+                return raw
+            raw += chunk
+        return None
+
     async def _create_recipe(self, request: web.Request) -> web.Response:
         self._check_token(request)
+        raw = await self._read_capped(request, RECIPE_BODY_LIMIT)
+        if raw is None:
+            return web.json_response({"error": "recipe too large"}, status=400)
         try:
-            body = await request.json()
+            body = json.loads(raw)
         except ValueError:
             # json.JSONDecodeError and UnicodeDecodeError are both ValueErrors.
             return web.json_response({"error": "invalid JSON"}, status=400)

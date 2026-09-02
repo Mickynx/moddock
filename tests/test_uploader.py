@@ -6,6 +6,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from moddock.uploader import (
+    RECIPE_BODY_LIMIT,
     UploadServer,
     qr_svg,
     sanitize_filename,
@@ -200,6 +201,36 @@ async def test_create_recipe_endpoint(client_and_server):
 
     resp = await client.post("/u/wrong/recipes", json=payload)
     assert resp.status == 404
+
+
+async def test_create_recipe_rejects_oversized_body(client_and_server):
+    client, _, _, creator = client_and_server
+    # Valid JSON, one byte over the cap: the refusal must be about the size.
+    body = b'{"name": "' + b"x" * (RECIPE_BODY_LIMIT - 11) + b'"}'
+    assert len(body) == RECIPE_BODY_LIMIT + 1
+    resp = await client.post(
+        "/u/testtoken/recipes",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status == 400
+    assert await resp.json() == {"error": "recipe too large"}
+    assert creator.bodies == []
+
+
+async def test_create_recipe_accepts_body_at_the_cap(client_and_server):
+    """A body at the limit must not be truncated by a short stream read."""
+    client, _, _, creator = client_and_server
+    name = "x" * (RECIPE_BODY_LIMIT - 12)
+    body = b'{"name": "' + name.encode() + b'"}'
+    assert len(body) == RECIPE_BODY_LIMIT
+    resp = await client.post(
+        "/u/testtoken/recipes",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status == 200
+    assert creator.bodies == [{"name": name}]
 
 
 async def test_create_recipe_rejects_malformed_json(client_and_server):
