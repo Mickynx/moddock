@@ -136,11 +136,16 @@ entry stays legacy-flagged and read-only until the game is detected.
    - `backup` rules: at enable, an existing `dst` is moved to
      `~/.local/share/moddock/backup/<appid>/<dst>` before the copy, and the
      deploy item records a persisted `"displaced": true` flag (provenance
-     about the game's original file, not derived enable-state). Disable and
-     delete restore the backup (move it back) instead of just unlinking;
-     for a displaced item whose backup is absent, recall is a NO-OP — the
-     restored original is already in place and must never be unlinked
-     (this is what makes repeated disable/delete safe). State for a
+     about the game's original file, not derived enable-state). On disable and
+     delete, a parked backup FILE is the first authority: when it exists,
+     recall always unlinks the deployed copy and restores it (repairing a
+     stale flag on the way — this covers a crash between parking and the
+     manifest save); only when no backup is parked does the flag decide:
+     displaced → NO-OP (the restored original is already in place and must
+     never be unlinked; this is what makes repeated disable/delete safe),
+     not displaced → plain unlink. Enable maintains the flag three-state:
+     parked backup → true; dst occupied, nothing parked → park + true;
+     neither → false (nothing left to protect). State for a
      displaced item: it counts as deployed iff its backup file exists AND
      the `dst` file exists; never-displaced backup items use plain `dst`
      presence. A backup is re-taken whenever `dst` exists with no parked
