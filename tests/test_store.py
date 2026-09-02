@@ -149,6 +149,24 @@ def test_claim_map_rejects_dst_collision_across_recipes(tmp_path):
     assert len(store.list_mods("1", game)) == 2
 
 
+def test_claim_map_folds_case(tmp_path):
+    """Steam libraries on exFAT/NTFS fold case, so "Mod.pak" and "mod.pak"
+    are one file there — the claim map must see them as one destination."""
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    store.import_mod("1", game, "Upper",
+                     _archive(tmp_path, "first.zip", stem="Mod"), PAK_RECIPE)
+
+    with pytest.raises(StoreError) as excinfo:
+        store.import_mod("1", game, "Lower",
+                         _archive(tmp_path, "second.zip", stem="mod"),
+                         PAK_RECIPE)
+    message = str(excinfo.value)
+    assert "Upper" in message
+    assert "mod.pak" in message  # the rejected item keeps its own spelling
+    assert [m["name"] for m in store.list_mods("1", game)] == ["Upper"]
+
+
 def test_refuse_rule_rejects_unmanaged_file_at_import(tmp_path):
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
@@ -162,27 +180,41 @@ def test_refuse_rule_rejects_unmanaged_file_at_import(tmp_path):
     assert (game.mods_dir / "scarlet.pak").read_bytes() == b"hand-installed"
 
 
-def test_backup_rule_backs_up_and_restores(tmp_path):
-    store = ModStore(tmp_path / "base")
-    game = _game(tmp_path)
-    original = game.install_dir / "SB" / "original.dll"
-    original.parent.mkdir(parents=True, exist_ok=True)
-    original.write_bytes(b"vanilla")
-
-    recipe = recipe_from_dict(
+def _backup_recipe():
+    return recipe_from_dict(
         {"name": "replace", "rules": [
             {"match": ["*.dll"], "anchor": "game_root", "subpath": "SB",
              "mapping": "flatten", "overwrite": "backup"}]},
         recipe_id="rep",
     )
-    archive = tmp_path / "r.zip"
+
+
+def _dll_archive(tmp_path: Path, member: str = "original.dll") -> Path:
+    archive = tmp_path / f"{member}.zip"
     with zipfile.ZipFile(archive, "w") as zf:
-        zf.writestr("original.dll", "modded")
-    store.import_mod("1", game, "Replacer", archive, recipe)
+        zf.writestr(member, "modded")
+    return archive
+
+
+def _replacer(tmp_path: Path, *, vanilla: bool = True):
+    """Store + game with a "Replacer" mod that overwrites SB/original.dll."""
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    original = game.install_dir / "SB" / "original.dll"
+    if vanilla:
+        original.parent.mkdir(parents=True, exist_ok=True)
+        original.write_bytes(b"vanilla")
+    store.import_mod("1", game, "Replacer", _dll_archive(tmp_path),
+                     _backup_recipe())
+    backup = tmp_path / "base" / "backup" / "1" / "SB" / "original.dll"
+    return store, game, original, backup
+
+
+def test_backup_rule_backs_up_and_restores(tmp_path):
+    store, game, original, backup = _replacer(tmp_path)
 
     store.set_enabled("1", game, "Replacer", True)
     assert original.read_bytes() == b"modded"
-    backup = tmp_path / "base" / "backup" / "1" / "SB" / "original.dll"
     assert backup.read_bytes() == b"vanilla"
 
     # Re-enabling must NOT re-backup (the true original is preserved).
@@ -192,6 +224,62 @@ def test_backup_rule_backs_up_and_restores(tmp_path):
     store.set_enabled("1", game, "Replacer", False)
     assert original.read_bytes() == b"vanilla"
     assert not backup.exists()
+
+
+def test_disabling_twice_keeps_the_restored_original(tmp_path):
+    """The second disable must not unlink the file the first one restored.
+
+    Presence at the destination cannot tell "our copy" from "the game's own
+    file we put back", so a naive recall would delete the vanilla file on the
+    next toggle. The persisted `displaced` flag is what distinguishes them.
+    """
+    store, game, original, backup = _replacer(tmp_path)
+    store.set_enabled("1", game, "Replacer", True)
+    store.set_enabled("1", game, "Replacer", False)
+    assert original.read_bytes() == b"vanilla"
+
+    # The mod is off even though its destination is occupied (by the game).
+    assert store.list_mods("1", game)[0]["state"] == "disabled"
+
+    store.set_enabled("1", game, "Replacer", False)
+    assert original.read_bytes() == b"vanilla"
+    assert not backup.exists()
+
+
+def test_delete_after_disable_keeps_the_restored_original(tmp_path):
+    store, game, original, backup = _replacer(tmp_path)
+    store.set_enabled("1", game, "Replacer", True)
+    store.set_enabled("1", game, "Replacer", False)
+
+    store.delete_mod("1", game, "Replacer")
+    assert original.read_bytes() == b"vanilla"
+    assert store.list_mods("1", game) == []
+    assert not (tmp_path / "base" / "mods" / "1" / "Replacer").exists()
+
+
+def test_reenable_after_disable_backs_the_original_up_again(tmp_path):
+    store, game, original, backup = _replacer(tmp_path)
+    store.set_enabled("1", game, "Replacer", True)
+    store.set_enabled("1", game, "Replacer", False)
+
+    store.set_enabled("1", game, "Replacer", True)
+    assert original.read_bytes() == b"modded"
+    assert backup.read_bytes() == b"vanilla"
+    assert store.list_mods("1", game)[0]["state"] == "enabled"
+
+
+def test_backup_item_that_displaced_nothing_toggles_normally(tmp_path):
+    """A backup-mode file with no pre-existing original behaves like any other."""
+    store, game, original, backup = _replacer(tmp_path, vanilla=False)
+
+    store.set_enabled("1", game, "Replacer", True)
+    assert original.read_bytes() == b"modded"
+    assert not backup.exists()
+    assert store.list_mods("1", game)[0]["state"] == "enabled"
+
+    store.set_enabled("1", game, "Replacer", False)
+    assert not original.exists()
+    assert store.list_mods("1", game)[0]["state"] == "disabled"
 
 
 def test_delete_restores_backup(tmp_path):
@@ -265,6 +353,42 @@ def test_delete_enabled_mod_removes_files_everywhere(tmp_path):
     assert store.list_mods("1", game) == []
     assert not (game.mods_dir / "scarlet.pak").exists()
     assert not (tmp_path / "base" / "mods" / "1" / "Scarlet").exists()
+
+
+def test_delete_wraps_os_error_and_keeps_the_entry(tmp_path, monkeypatch):
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
+    store.set_enabled("1", game, "Scarlet", True)
+
+    def boom(self, missing_ok=False):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "unlink", boom)
+    with pytest.raises(StoreError):
+        store.delete_mod("1", game, "Scarlet")
+    monkeypatch.undo()
+    # The mod stays known so the user can retry the delete.
+    assert [m["name"] for m in store.list_mods("1", game)] == ["Scarlet"]
+
+
+def test_delete_wraps_manifest_write_failure_and_keeps_the_entry(
+    tmp_path, monkeypatch
+):
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
+
+    def boom(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(ModStore, "_save_manifest", boom)
+    with pytest.raises(StoreError):
+        store.delete_mod("1", game, "Scarlet")
+    monkeypatch.undo()
+    # The repository is gone by then, but the entry must survive so the mod
+    # stays visible and the retry can finish the job.
+    assert [m["name"] for m in store.list_mods("1", game)] == ["Scarlet"]
 
 
 def test_manifest_written_with_deploy_list(tmp_path):

@@ -123,12 +123,30 @@ class ModStore:
     def _claimed(
         self, manifest: dict, game: UEGameInfo | None
     ) -> dict[str, str]:
-        """Destination -> owning mod name, over every entry in the manifest."""
+        """Destination -> owning mod name, over every entry in the manifest.
+
+        Keyed case-insensitively, for the same reason apply_recipe folds case
+        within one recipe: a Steam library on exFAT/NTFS treats "Mod.pak" and
+        "mod.pak" as one file, so two mods spelling a destination differently
+        would silently clobber each other there.
+        """
         claimed: dict[str, str] = {}
         for name, entry in sorted(manifest["mods"].items()):
             for item in self._entry_deploy(entry, game) or []:
-                claimed[item["dst"]] = name
+                claimed[item["dst"].lower()] = name
         return claimed
+
+    def _is_deployed(self, appid: str, game: UEGameInfo, item: dict) -> bool:
+        """Is this item's file currently our copy sitting at the destination?
+
+        For an item that displaced one of the game's own files, presence at
+        the destination proves nothing — after a disable the game's restored
+        original occupies exactly that path. The backup is the witness
+        instead: it exists only while our copy is deployed over it.
+        """
+        if item.get("overwrite") == "backup" and item.get("displaced"):
+            return self._backup_path(appid, item["dst"]).is_file()
+        return (game.install_dir / item["dst"]).is_file()
 
     # -- operations --------------------------------------------------------
 
@@ -168,7 +186,7 @@ class ModStore:
             # mods claiming the same one would let either destroy or hijack
             # the other's file. Rejecting the second import is the honest
             # failure.
-            owner = claimed.get(item.dst)
+            owner = claimed.get(item.dst.lower())
             if owner is not None:
                 shutil.rmtree(repo, ignore_errors=True)
                 raise StoreError(
@@ -217,9 +235,7 @@ class ModStore:
             state = "disabled"
             if game is not None and game.install_dir is not None and deploy:
                 present = sum(
-                    1
-                    for item in deploy
-                    if (game.install_dir / item["dst"]).is_file()
+                    1 for item in deploy if self._is_deployed(appid, game, item)
                 )
                 if present == len(deploy):
                     state = "enabled"
@@ -271,12 +287,17 @@ class ModStore:
                         f'the stored copy of "{missing}" is missing — delete '
                         "the mod and import it again"
                     )
+                displaced = False
                 for item in deploy:
                     dst_abs = game.install_dir / item["dst"]
                     dst_abs.parent.mkdir(parents=True, exist_ok=True)
                     backup = self._backup_path(appid, item["dst"])
-                    # Only the first enable backs up: a re-enable would
-                    # otherwise back up our own copy and lose the original.
+                    # A backup is taken whenever a file we did not deploy sits
+                    # at the destination and nothing is parked yet — on the
+                    # first enable, and again after a disable put the game's
+                    # original back. An existing backup is never overwritten,
+                    # so a re-enable cannot bury the true original under our
+                    # own copy.
                     if (
                         item.get("overwrite") == "backup"
                         and dst_abs.exists()
@@ -284,31 +305,45 @@ class ModStore:
                     ):
                         backup.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(dst_abs), str(backup))
+                        # Persisted provenance about the GAME's file, not
+                        # derived enable-state: it records that this
+                        # destination once held something of the game's that
+                        # we must never unlink. Enable-state stays derived
+                        # from the filesystem.
+                        item["displaced"] = True
+                        displaced = True
                     # Overwriting is safe: the import-time claim map and the
                     # refuse check ensure any file already at this path is
                     # ModDock's own (possibly stale) copy, so enable doubles
                     # as repair and is idempotent.
                     shutil.copy2(repo / item["src"], dst_abs)
+                if displaced and "deploy" in entry:
+                    self._save_manifest(appid, manifest)
             else:
                 for item in deploy:
-                    self._recall(appid, game, item["dst"])
+                    self._recall(appid, game, item)
         except OSError as exc:
             raise StoreError(str(exc)) from exc
 
-    def _recall(self, appid: str, game: UEGameInfo, dst: str) -> None:
+    def _recall(self, appid: str, game: UEGameInfo, item: dict) -> None:
         """Undo one deployed item: restore the backup, or just remove ours.
 
         Only the file itself is touched — directories are left in place
         because they are shared with the game and with other mods.
         """
-        dst_abs = game.install_dir / dst
-        backup = self._backup_path(appid, dst)
-        if backup.is_file():
-            dst_abs.unlink(missing_ok=True)
-            dst_abs.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(backup), str(dst_abs))
-        else:
-            dst_abs.unlink(missing_ok=True)
+        dst_abs = game.install_dir / item["dst"]
+        backup = self._backup_path(appid, item["dst"])
+        if item.get("overwrite") == "backup" and item.get("displaced"):
+            if backup.is_file():
+                dst_abs.unlink(missing_ok=True)
+                dst_abs.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(backup), str(dst_abs))
+            # No backup parked means the original is already back at the
+            # destination (an earlier disable restored it). Unlinking here
+            # would destroy the game's own file, so this is a no-op — which
+            # is what makes disable and delete safely repeatable.
+            return
+        dst_abs.unlink(missing_ok=True)
 
     def delete_mod(
         self, appid: str, game: UEGameInfo | None, mod_name: str
@@ -325,16 +360,18 @@ class ModStore:
         try:
             for item in deploy:
                 if usable_game is not None:
-                    self._recall(appid, usable_game, item["dst"])
+                    self._recall(appid, usable_game, item)
                 # A backup can outlive the game it was taken from (the install
-                # dir may be gone, or the recall above may have found the
-                # destination's parent missing); nothing else will ever
-                # restore it, so it goes with the mod.
+                # dir may be gone, so the recall above could not put it back);
+                # nothing else will ever restore it, so it goes with the mod.
                 self._backup_path(appid, item["dst"]).unlink(missing_ok=True)
             shutil.rmtree(repo, ignore_errors=True)
+            del manifest["mods"][mod_name]
+            self._save_manifest(appid, manifest)
         except OSError as exc:
             # The manifest entry is deliberately kept so the mod stays known
-            # and the user can retry the delete.
+            # and the user can retry the delete. By the time the manifest
+            # write runs the repository is already gone, so a failure there
+            # would otherwise strand the mod: listed nowhere, yet still
+            # holding its claim on every destination.
             raise StoreError(str(exc)) from exc
-        del manifest["mods"][mod_name]
-        self._save_manifest(appid, manifest)
