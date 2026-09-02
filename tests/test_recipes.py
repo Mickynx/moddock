@@ -51,6 +51,24 @@ def test_from_dict_validates():
     assert recipe_from_dict(recipe_to_dict(r), recipe_id=r.id).rules == r.rules
 
 
+def test_from_dict_rejects_non_list_match():
+    # A bare string would otherwise be iterated per character, turning the
+    # stray "*" into a catch-all that deploys the whole upload.
+    with pytest.raises(RecipeError) as exc:
+        _recipe(rules=[{"match": "*.pak", "anchor": "game_root", "subpath": ""}])
+    assert "list" in str(exc.value)
+    # A non-iterable must still come back as RecipeError, not TypeError.
+    with pytest.raises(RecipeError):
+        _recipe(rules=[{"match": 7, "anchor": "game_root", "subpath": ""}])
+
+
+def test_apply_duplicate_dst_is_case_insensitive():
+    # Steam libraries on exFAT/NTFS fold case, so these are one file.
+    with pytest.raises(RecipeError) as exc:
+        apply_recipe(_recipe(), ["a/MOD.PAK", "b/mod.pak"], ANCHORS)
+    assert "mod.pak" in str(exc.value).lower()
+
+
 def test_apply_flatten_and_ordering():
     r = recipe_from_dict(
         {

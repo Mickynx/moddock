@@ -78,9 +78,12 @@ def recipe_from_dict(data: dict, *, recipe_id: str, builtin: bool = False) -> Re
     for raw in raw_rules:
         if not isinstance(raw, dict):
             raise RecipeError("each rule must be an object")
-        patterns = tuple(
-            str(p).strip() for p in raw.get("match", []) if str(p).strip()
-        )
+        # Must be a list: a bare string would be iterated per character, and a
+        # stray "*" pattern is a catch-all that deploys the whole upload.
+        raw_match = raw.get("match", [])
+        if not isinstance(raw_match, list):
+            raise RecipeError("each rule's match must be a list of patterns")
+        patterns = tuple(str(p).strip() for p in raw_match if str(p).strip())
         if not patterns:
             raise RecipeError("each rule needs at least one match pattern")
         anchor = raw.get("anchor")
@@ -178,13 +181,17 @@ def apply_recipe(
         )
     if not items:
         raise RecipeError("no files in the upload match this install method")
+    # Keyed case-insensitively: Steam libraries on exFAT/NTFS fold case, so
+    # "MOD.PAK" and "mod.pak" are one file there and the second would silently
+    # clobber the first. The message keeps the original spelling.
     seen: dict[str, str] = {}
     for item in items:
-        if item.dst in seen:
+        key = item.dst.lower()
+        if key in seen:
             raise RecipeError(
                 f'two files map to the same destination "{item.dst}"'
             )
-        seen[item.dst] = item.src
+        seen[key] = item.src
     if recipe.validate == "pak-set":
         errors = pak_set_errors([i.src for i in items])
         if errors:
