@@ -55,10 +55,14 @@ A recipe is a declarative, JSON-serializable object:
 - **mapping** — `flatten` (file lands as its basename under the target) or
   `preserve_tree` (the archive-relative path is preserved under the
   target). Before mapping, a single wrapping top-level directory in the
-  archive is stripped automatically (the most common packaging shape).
-- **overwrite** — `refuse` (default): enabling fails if the destination
-  holds a file ModDock does not manage. `backup`: the original file is
-  backed up first and restored on disable/delete (see §5).
+  archive is stripped automatically (the most common packaging shape) —
+  exactly one level, so the mod's own layout below it survives.
+- **overwrite** — `refuse` (default): the IMPORT fails if the destination
+  already holds a file ModDock does not manage (see the clarification in
+  §4); enable then overwrites its own claimed paths freely. `backup`: the
+  original file is backed up first and restored on disable/delete (see
+  §5). A destination that is a directory cannot be backed up and is
+  refused at enable.
 - **leftover** — what to do with files no rule matched: `ignore` (skip
   them) or `fail` (reject the whole upload naming the first orphan).
 - **validate** — optional named validator run against the matched file
@@ -70,8 +74,8 @@ A recipe is a declarative, JSON-serializable object:
 |---|---|---|
 | `ue-paks-mods` | UE ~mods (pak) | pak/utoc/ucas → `paks_dir/~mods`, flatten, validate pak-set |
 | `ue-logic-mods` | UE LogicMods | pak/utoc/ucas → `paks_dir/LogicMods`, flatten, validate pak-set |
-| `game-root-merge` | Merge into game folder | `**` → `game_root`, preserve_tree |
-| `win64-drop` | Drop next to game EXE | `**` → `win64_dir`, preserve_tree |
+| `game-root-merge` | Merge into game folder | `*` → `game_root`, preserve_tree |
+| `win64-drop` | Drop next to game EXE | `*` → `win64_dir`, preserve_tree |
 
 Custom recipes live in `~/.local/share/moddock/recipes.json`, are created
 from the upload page, and can be inspected/deleted from the panel's
@@ -142,8 +146,11 @@ entry stays legacy-flagged and read-only until the game is detected.
      stale flag on the way — this covers a crash between parking and the
      manifest save); only when no backup is parked does the flag decide:
      displaced → NO-OP (the restored original is already in place and must
-     never be unlinked; this is what makes repeated disable/delete safe),
-     not displaced → plain unlink. Enable maintains the flag three-state:
+     never be unlinked; this is what makes repeated disable/delete safe) —
+     except when the file at `dst` is byte-identical to the stored copy,
+     which means the backup went missing (deleted by hand) while our copy
+     was still deployed, so that file is ours and is unlinked; not
+     displaced → plain unlink. Enable maintains the flag three-state:
      parked backup → true; dst occupied, nothing parked → park + true;
      neither → false (nothing left to protect). State for a
      displaced item: it counts as deployed iff its backup file exists AND
@@ -159,22 +166,40 @@ entry stays legacy-flagged and read-only until the game is detected.
      freely at its own claimed paths; that is what makes enable an
      idempotent repair. The import-time check is where foreign files are
      refused.
+4. **The manifest is not trusted on read-back.** Every `dst` loaded from
+   disk is validated before use: non-empty, relative, no `..` component.
+   An entry that fails is reported as a corrupted entry (listed, always
+   disabled, not enableable) and delete falls back to removing only the
+   repository directory and the manifest entry — nothing under the game
+   or the backup tree is touched on its word.
+5. **A backup is only reaped while the game is visible.** `game is None`
+   means the install dir cannot be seen — an unmounted SD card as much as
+   an uninstalled game — so deleting a mod then leaves the parked original
+   in place (a stale backup is the cheap mistake; destroying a live one is
+   not). A destination that is a directory is refused at enable rather
+   than parked, since a directory in the backup tree wedges every later
+   operation.
 
 ## 5. Import Pipeline (per upload)
 
 1. Upload page sends: file + appid + recipe id.
-2. Extract to temp (unchanged: zip stdlib / 7z via system tool, temp under
-   the plugin data dir, containment sweep).
-3. Strip a single wrapping top-level directory if present.
-4. Apply the recipe: first-match rule per file → deploy list; `leftover`
-   policy for unmatched files; recipe validator (e.g. pak-set) over the
-   matched set.
+2. Resolve the game's anchors first, before anything is written: a game
+   that cannot supply them fails without leaving a repository behind.
+3. Ingest into the repository: extract to temp (zip stdlib / 7z via system
+   tool, temp under the plugin data dir, containment sweep), strip a single
+   wrapping top-level directory if present (`__MACOSX` metadata is ignored
+   when deciding and never ingested), then copy the whole tree into
+   `mods/<appid>/<mod>/` preserving the (stripped) archive-relative paths.
+   The repository copy — the full upload, not just the matched files — is
+   what every later step works from.
+4. Apply the recipe to that tree: first-match rule per file → deploy list;
+   `leftover` policy for unmatched files; recipe validator (e.g. pak-set)
+   over the matched set.
 5. Safety checks: intra-upload dst uniqueness; cross-mod claim map;
-   refuse-rule unmanaged collision (checked now and again at enable).
-6. Copy matched files into the repository preserving their (stripped)
-   archive-relative paths; write the manifest entry; enable immediately.
-7. Any failure discards everything (repo dir removed, staging file
-   discarded) and reports the reason verbatim to the upload page.
+   refuse-rule unmanaged collision.
+6. Write the manifest entry; enable immediately.
+7. Any failure from step 3 on removes the repository directory and discards
+   the staging file, and reports the reason verbatim to the upload page.
 
 ## 6. Upload Page and Panel Changes
 

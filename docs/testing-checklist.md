@@ -15,8 +15,9 @@ as a fake game file for the backup test.
 5. [ ] Phone on the same LAN: QR opens the page; the game dropdown lists
        Stellar Blade and the install-method dropdown lists the four
        built-ins. BOTH are required — uploading with either unpicked is
-       blocked with a message on the page; both choices are remembered
-       for that game on the next visit. Pick "UE ~mods (pak)".
+       blocked with a message on the page; on the next visit the game comes
+       back as the last one used and the install method as the last one used
+       FOR THAT GAME. Pick "UE ~mods (pak)".
 6. [ ] The file picker allows selecting BOTH mod archives at once; each
        file uploads with its own progress bar.
 7. [ ] Each archive reports `installed as "<name>"` on the page; the mods
