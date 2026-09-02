@@ -67,7 +67,8 @@ ModDock is not yet on the Decky store. To sideload:
 | "already exists and is not managed by ModDock" | Something else (a hand-installed mod, the game itself) owns that path. Remove it by hand, or use an install method whose rule has backup enabled. |
 | An anchor is greyed out in the new-method form | The game has no such directory — e.g. `win64_dir` only appears once `<Project>/Binaries/Win64` exists. Pick another anchor, or install the framework that creates it first. |
 | Upload fails with "no files in the upload match this install method" | The method's rules match nothing in that archive — check the patterns (e.g. `*.lua` vs `*.LUA` is fine, but `lua` alone is not) or pick another method. |
-| A mod installed, but only part of it | The method ignored the files no rule matched. The game view shows which method placed each mod; create a variant with a rule for the missing files, or set the new method's leftover policy to "fail" so unmatched files are named instead of skipped. |
+| A mod installed, but some archive files went nowhere | The method ignored the files no rule matched. The game view shows which method placed each mod; create a variant with a rule for the missing files, or set the new method's leftover policy to "fail" so unmatched files are named instead of skipped. |
+| A mod shows "partial — some files missing" | Some of its recorded destinations are gone (an enable interrupted mid-copy, files deleted by hand, a game verify). Toggle the mod off and on: enable re-copies every file from the store's full copy and is safe to repeat. |
 
 ## Development
 
