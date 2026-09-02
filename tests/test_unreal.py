@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from moddock.adapters.unreal import MODS_DIR_NAME, detect_ue_game
+import pytest
+
+from moddock.adapters.unreal import MODS_DIR_NAME, UEGameInfo, detect_ue_game
 
 
 def _make_ue_game(
@@ -94,3 +96,38 @@ def test_missing_shipping_exe_is_soft_signal(tmp_path):
 
 def test_nonexistent_dir(tmp_path):
     assert detect_ue_game(tmp_path / "nope") is None
+
+
+def test_detect_fills_install_dir_and_win64(tmp_path):
+    _make_ue_game(tmp_path, project="SB")
+    info = detect_ue_game(tmp_path)
+    assert info.install_dir == tmp_path
+    assert info.win64_dir == tmp_path / "SB" / "Binaries" / "Win64"
+
+
+def test_win64_dir_none_when_absent(tmp_path):
+    _make_ue_game(tmp_path, shipping_exe=False)
+    info = detect_ue_game(tmp_path)
+    assert info.win64_dir is None
+
+
+def test_anchor_map(tmp_path):
+    _make_ue_game(tmp_path, project="SB")
+    anchors = detect_ue_game(tmp_path).anchor_map()
+    assert anchors == {
+        "game_root": "",
+        "paks_dir": "SB/Content/Paks",
+        "win64_dir": "SB/Binaries/Win64",
+    }
+
+
+def test_anchor_map_requires_install_dir():
+    info = UEGameInfo(
+        project_name="SB",
+        paks_dir=Path("/x/SB/Content/Paks"),
+        mods_dir=Path("/x/SB/Content/Paks/~mods"),
+        is_iostore=False,
+        has_shipping_exe=False,
+    )
+    with pytest.raises(ValueError):
+        info.anchor_map()

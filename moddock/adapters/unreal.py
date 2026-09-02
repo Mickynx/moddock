@@ -21,6 +21,22 @@ class UEGameInfo:
     mods_dir: Path
     is_iostore: bool
     has_shipping_exe: bool
+    install_dir: Path | None = None
+    win64_dir: Path | None = None
+
+    def anchor_map(self) -> dict[str, str | None]:
+        """Game-root-relative anchor paths for the recipe engine."""
+        if self.install_dir is None:
+            raise ValueError("anchor_map() needs install_dir")
+
+        def rel(path: Path) -> str:
+            return path.relative_to(self.install_dir).as_posix()
+
+        return {
+            "game_root": "",
+            "paks_dir": rel(self.paks_dir),
+            "win64_dir": rel(self.win64_dir) if self.win64_dir else None,
+        }
 
 
 def detect_ue_game(install_dir: Path) -> UEGameInfo | None:
@@ -47,10 +63,13 @@ def detect_ue_game(install_dir: Path) -> UEGameInfo | None:
     has_shipping_exe = binaries.is_dir() and (
         next(binaries.rglob("*-Win64-Shipping.exe"), None) is not None
     )
+    win64 = install_dir / project_name / "Binaries" / "Win64"
     return UEGameInfo(
         project_name=project_name,
         paks_dir=paks_dir,
         mods_dir=paks_dir / MODS_DIR_NAME,
         is_iostore=is_iostore,
         has_shipping_exe=has_shipping_exe,
+        install_dir=install_dir,
+        win64_dir=win64 if win64.is_dir() else None,
     )
