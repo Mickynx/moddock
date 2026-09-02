@@ -17,10 +17,14 @@ import {
 export function GameDetailView({
   appid,
   name,
+  refreshKey,
   onBack,
 }: {
   appid: string;
   name: string;
+  // Bumped by the root on every upload event, so a web upload that just
+  // installed a mod shows up without leaving the view.
+  refreshKey: number;
   onBack: () => void;
 }) {
   const [mods, setMods] = useState<ModEntry[]>([]);
@@ -39,7 +43,7 @@ export function GameDetailView({
       .catch((e) => setError(`Could not load mods: ${String(e)}`));
   }, [appid]);
 
-  useEffect(refresh, [refresh]);
+  useEffect(refresh, [refresh, refreshKey]);
 
   return (
     <>
@@ -52,13 +56,14 @@ export function GameDetailView({
         {!installed && (
           <PanelSectionRow>
             <div>
-              Game not detected as installed — mod files cannot be changed.
+              Game not detected as installed — stored mods stay disabled and
+              can be deleted, but not enabled.
             </div>
           </PanelSectionRow>
         )}
         {installed && mods.length === 0 && (
           <PanelSectionRow>
-            <div>No mods yet — upload one from the Inbox.</div>
+            <div>No mods yet — upload one from your phone (Upload Settings).</div>
           </PanelSectionRow>
         )}
         {mods.map((mod) => (
@@ -86,9 +91,10 @@ export function GameDetailView({
         ))}
         {mods.map((mod) => (
           <PanelSectionRow key={`del-${mod.name}`}>
+            {/* Deleting works even for an uninstalled game: the copy model
+                means only the store repository needs cleaning then. */}
             <ButtonItem
               layout="below"
-              disabled={!installed}
               onClick={async () => {
                 if (confirmDelete !== mod.name) {
                   setConfirmDelete(mod.name);

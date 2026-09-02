@@ -1,28 +1,21 @@
 import { ButtonItem, PanelSection, PanelSectionRow } from "@decky/ui";
 import { useEffect, useState } from "react";
 
-import { getManagedGames, listInbox, ManagedGame } from "../api";
+import { getManagedGames, ManagedGame } from "../api";
 import type { View } from "../index";
 
-export function GamesView({
-  setView,
-  inboxTick,
-}: {
-  setView: (v: View) => void;
-  inboxTick: number;
-}) {
+export function GamesView({ setView }: { setView: (v: View) => void }) {
   const [games, setGames] = useState<ManagedGame[]>([]);
-  const [inboxCount, setInboxCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     getManagedGames()
-      .then(setGames)
+      .then((result) => {
+        setGames(result);
+        setError(null);
+      })
       .catch((e) => setError(`Could not load games: ${String(e)}`));
-    listInbox()
-      .then((entries) => setInboxCount(entries.length))
-      .catch((e) => setError(`Could not read the inbox: ${String(e)}`));
-  }, [inboxTick]);
+  }, []);
 
   return (
     <>
@@ -59,15 +52,11 @@ export function GamesView({
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
-      <PanelSection title="Import">
-        <PanelSectionRow>
-          <ButtonItem layout="below" onClick={() => setView({ kind: "inbox" })}>
-            {`Inbox (${inboxCount})`}
-          </ButtonItem>
-        </PanelSectionRow>
+      <PanelSection title="Upload">
         <PanelSectionRow>
           <ButtonItem
             layout="below"
+            description="Upload mods from your phone — they install directly"
             onClick={() => setView({ kind: "settings" })}
           >
             Upload Settings

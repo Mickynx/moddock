@@ -5,22 +5,22 @@ import { useEffect, useState } from "react";
 import { GamesView } from "./views/GamesView";
 import { AddGameView } from "./views/AddGameView";
 import { GameDetailView } from "./views/GameDetailView";
-import { InboxView } from "./views/InboxView";
 import { SettingsView } from "./views/SettingsView";
 
 export type View =
   | { kind: "games" }
   | { kind: "add" }
   | { kind: "detail"; appid: string; name: string }
-  | { kind: "inbox" }
   | { kind: "settings" };
 
 function Content() {
   const [view, setView] = useState<View>({ kind: "games" });
-  const [inboxTick, setInboxTick] = useState(0);
+  // Bumped on every "moddock_upload" event so an open mod list refreshes
+  // right after a web upload installs a mod.
+  const [uploadTick, setUploadTick] = useState(0);
 
   useEffect(() => {
-    const handler = () => setInboxTick((t) => t + 1);
+    const handler = () => setUploadTick((t) => t + 1);
     addEventListener("moddock_upload", handler);
     return () => removeEventListener("moddock_upload", handler);
   }, []);
@@ -33,20 +33,14 @@ function Content() {
         <GameDetailView
           appid={view.appid}
           name={view.name}
-          onBack={() => setView({ kind: "games" })}
-        />
-      );
-    case "inbox":
-      return (
-        <InboxView
-          refreshKey={inboxTick}
+          refreshKey={uploadTick}
           onBack={() => setView({ kind: "games" })}
         />
       );
     case "settings":
       return <SettingsView onBack={() => setView({ kind: "games" })} />;
     default:
-      return <GamesView setView={setView} inboxTick={inboxTick} />;
+      return <GamesView setView={setView} />;
   }
 }
 

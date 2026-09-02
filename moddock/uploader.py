@@ -1,8 +1,11 @@
 """LAN web-upload service.
 
-Serves a single mobile-friendly upload page behind a random URL token
-and streams multipart uploads into the inbox directory. Off by default;
-main.py starts/stops it from the panel toggle.
+Serves a single mobile-friendly upload page behind a random URL token.
+The page requires picking a target game up front; each uploaded file is
+streamed to a staging directory, handed to the installer callback
+(validate → import → enable, provided by main.py), and the staging copy
+is discarded — success or failure is reported straight back to the
+browser. Off by default; main.py starts/stops it from the panel toggle.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from typing import Awaitable, Callable
 
 from aiohttp import web
 
-ALLOWED_UPLOAD_EXTS = {".zip", ".7z", ".rar", ".pak", ".utoc", ".ucas"}
+ALLOWED_UPLOAD_EXTS = {".zip", ".7z", ".pak", ".utoc", ".ucas"}
 MAX_FILE_SIZE = 2 * 1024**3  # 2 GiB per file
 # Well under the 255-byte per-component limit of ext4/btrfs, leaving room for
 # the " (n)" collision suffix and the ".part" staging suffix.
@@ -33,36 +36,106 @@ UPLOAD_PAGE = """<!doctype html>
 body{font-family:system-ui,sans-serif;background:#0f141b;color:#e6ebf0;
      display:flex;flex-direction:column;align-items:center;padding:2rem 1rem}
 h1{font-size:1.3rem}
-input[type=file]{margin:1rem 0;max-width:100%}
+label{margin:.4rem 0}
+select{background:#1d2733;color:#e6ebf0;border:1px solid #33404f;
+       border-radius:6px;padding:.5rem;font-size:1rem;max-width:90vw}
+input[type=file]{margin:1rem 0;max-width:90vw}
 button{background:#3a9bed;border:0;color:#fff;padding:.7rem 2rem;
        border-radius:8px;font-size:1rem}
-#log{margin-top:1rem;font-size:.9rem;white-space:pre-line}
+button:disabled{opacity:.5}
+#items{width:min(28rem,90vw);margin-top:1rem}
+.item{margin:.6rem 0;font-size:.9rem}
+.name{word-break:break-all}
+.track{background:#1d2733;height:6px;border-radius:3px;margin:.25rem 0}
+.bar{background:#3a9bed;height:100%;width:0;border-radius:3px}
+.ok{color:#7bd88f}
+.bad{color:#ff6a6a}
+#hint{font-size:.9rem;opacity:.8}
 </style></head><body>
 <h1>ModDock — upload mods</h1>
-<p>Accepted: .zip .7z .pak .utoc .ucas</p>
+<label>Install to <select id="g"></select></label>
+<p id="hint">Accepted: .zip .7z .pak — mods install and enable immediately.</p>
 <input id="f" type="file" multiple>
-<button onclick="up()">Upload</button>
-<div id="log"></div>
+<button id="btn" onclick="up()">Upload &amp; install</button>
+<div id="items"></div>
 <script>
-async function up(){
-  const files=document.getElementById('f').files;
-  const log=document.getElementById('log');
-  if(!files.length){log.textContent='pick a file first';return}
-  const fd=new FormData();
-  for(const f of files) fd.append('file',f,f.name);
-  log.textContent='uploading…';
-  const r=await fetch(location.pathname,{method:'POST',body:fd});
-  const j=await r.json();
-  log.textContent='saved: '+j.saved.join(', ')+
-    (j.rejected.length?'\\nrejected: '+j.rejected.join('; '):'');
+const sel=document.getElementById('g');
+const btn=document.getElementById('btn');
+const items=document.getElementById('items');
+const hint=document.getElementById('hint');
+async function loadGames(){
+  try{
+    const r=await fetch(location.pathname+'/games');
+    const j=await r.json();
+    if(!j.games.length){
+      btn.disabled=true;
+      hint.textContent='No installed games are managed yet — use Add Game in the ModDock panel first.';
+      return;
+    }
+    for(const g of j.games){
+      const o=document.createElement('option');
+      o.value=g.appid; o.textContent=g.name;
+      sel.appendChild(o);
+    }
+    const last=localStorage.getItem('moddock_appid');
+    if(last && [...sel.options].some(o=>o.value===last)) sel.value=last;
+  }catch(e){
+    btn.disabled=true;
+    hint.textContent='Could not load the game list — reopen this page from the panel QR code.';
+  }
 }
+function row(name){
+  const box=document.createElement('div'); box.className='item';
+  const label=document.createElement('div'); label.className='name'; label.textContent=name;
+  const track=document.createElement('div'); track.className='track';
+  const bar=document.createElement('div'); bar.className='bar';
+  const status=document.createElement('div'); status.textContent='waiting…';
+  track.appendChild(bar); box.append(label,track,status); items.appendChild(box);
+  return {
+    progress(frac){ bar.style.width=(frac*100).toFixed(1)+'%'; status.textContent='uploading '+(frac*100).toFixed(0)+'%'; },
+    done(msg,ok){ bar.style.width='100%'; bar.style.background=ok?'#7bd88f':'#ff6a6a';
+                  status.textContent=msg; status.className=ok?'ok':'bad'; },
+  };
+}
+function sendOne(file,appid,ui){
+  return new Promise(resolve=>{
+    const fd=new FormData();
+    fd.append('appid',appid);
+    fd.append('file',file,file.name);
+    const x=new XMLHttpRequest();
+    x.open('POST',location.pathname);
+    x.upload.onprogress=e=>{ if(e.lengthComputable) ui.progress(e.loaded/e.total); };
+    x.onload=()=>{
+      let j=null; try{ j=JSON.parse(x.responseText); }catch(e){}
+      if(x.status===200 && j){
+        if(j.installed.length) ui.done('installed as "'+j.installed[0].mod+'"',true);
+        else ui.done(j.failed.length?j.failed[0].reason:'failed',false);
+      }else ui.done('upload failed (HTTP '+x.status+')',false);
+      resolve();
+    };
+    x.onerror=()=>{ ui.done('network error',false); resolve(); };
+    x.send(fd);
+  });
+}
+async function up(){
+  const files=[...document.getElementById('f').files];
+  if(!files.length){ hint.textContent='Pick one or more files first.'; return; }
+  const appid=sel.value;
+  if(!appid){ hint.textContent='Pick a game first.'; return; }
+  localStorage.setItem('moddock_appid',appid);
+  btn.disabled=true;
+  items.textContent='';
+  for(const f of files){ await sendOne(f,appid,row(f.name)); }
+  btn.disabled=false;
+}
+loadGames();
 </script></body></html>"""
 
 
 def sanitize_filename(name: str) -> str | None:
     normalized = name.replace("\\", "/")
-    # Refuse anything that tried to walk out of the inbox, even though the
-    # basename extraction below would already neutralise it.
+    # Refuse anything that tried to walk out of the staging area, even though
+    # the basename extraction below would already neutralise it.
     if ".." in PurePosixPath(normalized).parts:
         return None
     base = PureWindowsPath(normalized).name
@@ -133,16 +206,26 @@ def _unique_path(directory: Path, name: str) -> Path:
     return candidate
 
 
+# The installer receives (staged file, appid) and returns (ok, detail):
+# the imported mod's name on success, a user-facing reason on failure.
+Installer = Callable[[Path, str], Awaitable[tuple[bool, str]]]
+GamesProvider = Callable[[], Awaitable[list[dict]]]
+
+
 class UploadServer:
     def __init__(
         self,
-        inbox: Path,
+        staging: Path,
         port: int,
+        installer: Installer | None = None,
+        games_provider: GamesProvider | None = None,
         on_upload: Callable[[str], Awaitable[None]] | None = None,
         host: str = "0.0.0.0",
     ):
-        self.inbox = inbox
+        self.staging = staging
         self.port = port
+        self.installer = installer
+        self.games_provider = games_provider
         self.on_upload = on_upload
         self.host = host
         self.token: str | None = None
@@ -151,6 +234,7 @@ class UploadServer:
     def build_app(self) -> web.Application:
         app = web.Application(client_max_size=MAX_FILE_SIZE + 1024**2)
         app.router.add_get("/u/{token}", self._page)
+        app.router.add_get("/u/{token}/games", self._games)
         app.router.add_post("/u/{token}", self._upload)
         return app
 
@@ -162,25 +246,44 @@ class UploadServer:
         self._check_token(request)
         return web.Response(text=UPLOAD_PAGE, content_type="text/html")
 
+    async def _games(self, request: web.Request) -> web.Response:
+        self._check_token(request)
+        games = await self.games_provider() if self.games_provider else []
+        return web.json_response({"games": games})
+
     async def _upload(self, request: web.Request) -> web.Response:
         self._check_token(request)
-        saved: list[str] = []
-        rejected: list[str] = []
-        self.inbox.mkdir(parents=True, exist_ok=True)
+        installed: list[dict] = []
+        failed: list[dict] = []
+        appid: str | None = None
+        self.staging.mkdir(parents=True, exist_ok=True)
         reader = await request.multipart()
         while True:
             part = await reader.next()
             if part is None:
                 break
+            if part.name == "appid" and not part.filename:
+                appid = (await part.text()).strip() or None
+                continue
             raw_name = part.filename or ""
             name = sanitize_filename(raw_name)
             if name is None:
-                rejected.append(f"{raw_name or '(unnamed)'}: file type not allowed")
+                failed.append(
+                    {
+                        "name": raw_name or "(unnamed)",
+                        "reason": "file type not allowed",
+                    }
+                )
                 continue
-            target = _unique_path(self.inbox, name)
+            if appid is None:
+                # The page always sends the appid field before the files;
+                # anything else is a malformed client.
+                failed.append({"name": name, "reason": "no game selected"})
+                continue
+            target = _unique_path(self.staging, name)
             # Stream to a staging name and rename on success, so a truncated
-            # transfer never shows up in the inbox under its final name.
-            temp = _unique_path(self.inbox, f"{target.name}.part")
+            # transfer is never handed to the installer.
+            temp = _unique_path(self.staging, f"{target.name}.part")
             try:
                 size = 0
                 too_large = False
@@ -193,28 +296,49 @@ class UploadServer:
                         fh.write(chunk)
                 if too_large:
                     _discard(temp)
-                    rejected.append(f"{name}: exceeds size limit")
+                    failed.append({"name": name, "reason": "exceeds size limit"})
                     continue
                 os.replace(temp, target)
             except OSError as exc:
                 # One unwritable file must not fail the whole upload.
                 _discard(temp)
-                rejected.append(f"{name}: could not be saved ({exc.strerror or exc})")
+                failed.append(
+                    {
+                        "name": name,
+                        "reason": f"could not be saved ({exc.strerror or exc})",
+                    }
+                )
                 continue
             except BaseException:
                 # Client disconnect or cancellation: leave nothing behind.
                 _discard(temp)
                 raise
-            saved.append(target.name)
-            if self.on_upload is not None:
-                try:
-                    await self.on_upload(target.name)
-                except Exception:
-                    # The file is already safely on disk; a failing hook must
-                    # not turn a successful upload into a 500. No decky logger
-                    # is available in this module, so the error is swallowed.
-                    pass
-        return web.json_response({"saved": saved, "rejected": rejected})
+            if self.installer is None:
+                _discard(target)
+                failed.append({"name": name, "reason": "installer not available"})
+                continue
+            # The staging copy is consumed either way: import copies the files
+            # it needs into the mod store, and a failed install has nothing to
+            # keep.
+            try:
+                ok, detail = await self.installer(target, appid)
+            except Exception as exc:  # noqa: BLE001 - report, don't 500
+                ok, detail = False, f"install failed: {exc}"
+            finally:
+                _discard(target)
+            if ok:
+                installed.append({"name": name, "mod": detail})
+                if self.on_upload is not None:
+                    try:
+                        await self.on_upload(name)
+                    except Exception:
+                        # The mod is already installed; a failing hook must
+                        # not turn a successful upload into a 500. No decky
+                        # logger is available in this module.
+                        pass
+            else:
+                failed.append({"name": name, "reason": detail})
+        return web.json_response({"installed": installed, "failed": failed})
 
     async def start(self) -> None:
         if self._runner is not None:

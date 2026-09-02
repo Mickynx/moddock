@@ -1,4 +1,5 @@
 import json
+import shutil
 import zipfile
 from pathlib import Path
 
@@ -38,6 +39,8 @@ def test_import_enable_disable_cycle(tmp_path):
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
     store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    repo_pak = tmp_path / "base" / "mods" / "1" / "Scarlet" / "scarlet.pak"
+    assert repo_pak.is_file()
 
     [mod] = store.list_mods("1", game)
     assert mod["name"] == "Scarlet"
@@ -45,14 +48,17 @@ def test_import_enable_disable_cycle(tmp_path):
 
     store.set_enabled("1", game, "Scarlet", True)
     assert (game.mods_dir / "scarlet.pak").is_file()
+    # Copy semantics: the repository keeps the full copy while enabled.
+    assert repo_pak.is_file()
     assert store.list_mods("1", game)[0]["state"] == "enabled"
 
     store.set_enabled("1", game, "Scarlet", False)
     assert not (game.mods_dir / "scarlet.pak").exists()
+    assert repo_pak.is_file()
     assert store.list_mods("1", game)[0]["state"] == "disabled"
 
 
-def test_partial_state_detected_and_repairable(tmp_path):
+def test_partial_state_detected_and_repaired_by_reenabling(tmp_path):
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
     store.import_mod("1", game, "Scarlet", _archive(tmp_path))
@@ -60,18 +66,36 @@ def test_partial_state_detected_and_repairable(tmp_path):
     (game.mods_dir / "scarlet.ucas").unlink()
 
     assert store.list_mods("1", game)[0]["state"] == "partial"
-    store.set_enabled("1", game, "Scarlet", False)  # repair by disabling
-    assert store.list_mods("1", game)[0]["state"] == "partial"  # ucas is gone for good
+    # Enable is idempotent repair: the repository copy is re-copied in.
+    store.set_enabled("1", game, "Scarlet", True)
+    assert store.list_mods("1", game)[0]["state"] == "enabled"
 
 
-def test_enable_collision_raises(tmp_path):
+def test_enable_overwrites_stale_copy(tmp_path):
+    """Import-time checks guarantee same-named files in ~mods are ModDock's
+    own, so enable may overwrite freely — that is what makes it idempotent."""
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
     store.import_mod("1", game, "Scarlet", _archive(tmp_path))
     game.mods_dir.mkdir(parents=True)
-    (game.mods_dir / "scarlet.pak").write_bytes(b"other")
-    with pytest.raises(StoreError):
+    (game.mods_dir / "scarlet.pak").write_bytes(b"stale")
+
+    store.set_enabled("1", game, "Scarlet", True)
+    assert (game.mods_dir / "scarlet.pak").read_bytes() == b"x"
+    assert store.list_mods("1", game)[0]["state"] == "enabled"
+
+
+def test_enable_with_missing_store_copy_raises(tmp_path):
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    (tmp_path / "base" / "mods" / "1" / "Scarlet" / "scarlet.ucas").unlink()
+
+    with pytest.raises(StoreError) as excinfo:
         store.set_enabled("1", game, "Scarlet", True)
+    assert "scarlet.ucas" in str(excinfo.value)
+    # Nothing was half-copied before the check.
+    assert not (game.mods_dir / "scarlet.pak").exists()
 
 
 def test_duplicate_mod_name_rejected(tmp_path):
@@ -105,17 +129,36 @@ def test_file_basename_conflict_between_mods_rejected(tmp_path):
     assert len(store.list_mods("1", game)) == 2
 
 
-def test_delete_without_game_refuses_and_keeps_manifest(tmp_path):
+def test_uninstall_then_reinstall_keeps_mods_disabled(tmp_path):
+    """Steam uninstalling a game removes its install dir, ~mods included.
+    Under copy semantics that merely disables everything: the repository is
+    intact, mods list as disabled, and can be re-enabled after a reinstall."""
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
     store.import_mod("1", game, "Scarlet", _archive(tmp_path))
     store.set_enabled("1", game, "Scarlet", True)
 
-    with pytest.raises(StoreError):
-        store.delete_mod("1", None, "Scarlet")
+    shutil.rmtree(tmp_path / "game")  # Steam uninstall
+    assert store.list_mods("1", None)[0]["state"] == "disabled"
 
-    assert [m["name"] for m in store.list_mods("1", game)] == ["Scarlet"]
-    assert (game.mods_dir / "scarlet.pak").is_file()
+    reinstalled = _game(tmp_path)  # Steam reinstall (fresh dirs)
+    assert store.list_mods("1", reinstalled)[0]["state"] == "disabled"
+    store.set_enabled("1", reinstalled, "Scarlet", True)
+    assert store.list_mods("1", reinstalled)[0]["state"] == "enabled"
+
+
+def test_delete_without_game_cleans_repository(tmp_path):
+    """With copy semantics a delete needs no ~mods access: the game dir (and
+    any enabled copies in it) is gone with the game, so deleting while the
+    game is uninstalled just clears the repository and the manifest."""
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    shutil.rmtree(tmp_path / "game")
+
+    store.delete_mod("1", None, "Scarlet")
+    assert store.list_mods("1", None) == []
+    assert not (tmp_path / "base" / "mods" / "1" / "Scarlet").exists()
 
 
 def test_set_enabled_wraps_os_error(tmp_path, monkeypatch):
@@ -126,7 +169,7 @@ def test_set_enabled_wraps_os_error(tmp_path, monkeypatch):
     def boom(*args, **kwargs):
         raise OSError("No space left on device")
 
-    monkeypatch.setattr("moddock.store.shutil.move", boom)
+    monkeypatch.setattr("moddock.store.shutil.copy2", boom)
     with pytest.raises(StoreError) as excinfo:
         store.set_enabled("1", game, "Scarlet", True)
     assert "No space left on device" in str(excinfo.value)
@@ -147,6 +190,8 @@ def test_delete_mod_wraps_os_error(tmp_path, monkeypatch):
         store.delete_mod("1", game, "Scarlet")
     assert "Permission denied" in str(excinfo.value)
     monkeypatch.setattr(Path, "unlink", real_unlink)
+    # The manifest entry survives a failed delete so the user can retry.
+    assert [m["name"] for m in store.list_mods("1", game)] == ["Scarlet"]
 
 
 def test_delete_enabled_mod_removes_files_everywhere(tmp_path):
@@ -157,6 +202,7 @@ def test_delete_enabled_mod_removes_files_everywhere(tmp_path):
     store.delete_mod("1", game, "Scarlet")
     assert store.list_mods("1", game) == []
     assert not (game.mods_dir / "scarlet.pak").exists()
+    assert not (tmp_path / "base" / "mods" / "1" / "Scarlet").exists()
 
 
 def test_manifest_written(tmp_path):
@@ -172,38 +218,11 @@ def test_manifest_written(tmp_path):
     ]
 
 
-def test_cross_partition_repo_fallback(tmp_path, monkeypatch):
-    """When the game sits on another filesystem, the repo must be placed
-    under <library-root>/.moddock/<appid> on that same filesystem."""
-    lib = tmp_path / "sdcard"
-    paks = lib / "steamapps" / "common" / "Game" / "SB" / "Content" / "Paks"
-    paks.mkdir(parents=True)
-    game = UEGameInfo(
-        project_name="SB",
-        paks_dir=paks,
-        mods_dir=paks / MODS_DIR_NAME,
-        is_iostore=False,
-        has_shipping_exe=True,
-    )
-    store = ModStore(tmp_path / "base")
-
-    real_stat_dev = {str(tmp_path / "base"): 1, str(paks): 2}
-
-    def fake_dev(path: Path) -> int:
-        for prefix, dev in real_stat_dev.items():
-            if str(path).startswith(prefix):
-                return dev
-        return 1
-
-    monkeypatch.setattr("moddock.store._device_of", fake_dev)
-    store.import_mod("7", game, "M", _archive(tmp_path))
-    assert (lib / ".moddock" / "7" / "M").is_dir()
-
-
 def test_import_rejects_file_already_unmanaged_in_mods_dir(tmp_path):
     """A hand-installed file in ~mods must never become ModDock-managed.
 
-    Otherwise delete_mod would happily unlink a file ModDock never put there.
+    Otherwise enable would overwrite, and delete would unlink, a file ModDock
+    never put there.
     """
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)

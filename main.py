@@ -11,7 +11,6 @@ import decky  # noqa: E402  (provided by Decky Loader)
 
 from moddock import importer  # noqa: E402
 from moddock.adapters.unreal import UEGameInfo, detect_ue_game  # noqa: E402
-from moddock.importer import inspect_upload  # noqa: E402
 from moddock.settings import Settings  # noqa: E402
 from moddock.steam import (  # noqa: E402
     discover_libraries,
@@ -22,7 +21,7 @@ from moddock.store import ModStore, StoreError, sanitize_mod_name  # noqa: E402
 from moddock.uploader import UploadServer, qr_svg  # noqa: E402
 
 BASE_DIR = Path.home() / ".local/share/moddock"
-INBOX_DIR = BASE_DIR / "inbox"
+STAGING_DIR = BASE_DIR / "staging"
 MIN_PORT, MAX_PORT = 1024, 65535
 
 
@@ -38,7 +37,12 @@ class Plugin:
             Path(decky.DECKY_PLUGIN_SETTINGS_DIR) / "settings.json"
         )
         self.store = ModStore(BASE_DIR)
-        INBOX_DIR.mkdir(parents=True, exist_ok=True)
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
+        # Staging files are per-upload scratch; anything still here is debris
+        # from an interrupted transfer in a previous session.
+        for stale in STAGING_DIR.iterdir():
+            if stale.is_file():
+                stale.unlink(missing_ok=True)
         # Extract under our own data directory instead of /tmp: on SteamOS and
         # Bazzite /tmp is tmpfs, so a multi-gigabyte archive would be unpacked
         # into RAM.
@@ -115,8 +119,8 @@ class Plugin:
         """Run a blocking store/import call off the shared event loop.
 
         Decky's event loop also serves our aiohttp uploader, so filesystem work
-        that can take seconds (extraction, moving gigabytes between
-        directories) must never run on it.
+        that can take seconds (extraction, copying gigabytes into ~mods) must
+        never run on it.
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -151,82 +155,46 @@ class Plugin:
     async def delete_mod(self, appid: str, mod_name: str) -> dict:
         game = self._managed_game(appid)
         info = self._detect(game["install_dir"]) if game else None
-        # A missing game is not short-circuited here: the store decides, and it
-        # refuses with a StoreError rather than orphaning installed files.
+        # A missing game is fine under the copy model: the store then cleans
+        # only its repository, since ~mods vanished with the install dir.
         try:
             await self._off_loop(self.store.delete_mod, appid, info, mod_name)
             return {"ok": True, "error": None}
         except StoreError as exc:
             return {"ok": False, "error": str(exc)}
 
-    # -- inbox -------------------------------------------------------------
+    # -- upload install pipeline ---------------------------------------------
 
-    async def list_inbox(self) -> list[dict]:
-        entries = []
-        loop = asyncio.get_running_loop()
-        for path in sorted(INBOX_DIR.iterdir()):
-            if not path.is_file():
-                continue
-            if path.suffix.lower() == ".part":
-                continue  # upload still streaming into its staging file
-            # inspect_upload extracts archives (and shells out for .7z), which
-            # can take seconds per file. This is the refresh path — panel open
-            # plus every "moddock_upload" event — so it must not run on the
-            # event loop: doing so would stall Decky and our own aiohttp
-            # uploader, which share that loop.
-            try:
-                status, detail = await loop.run_in_executor(
-                    None, inspect_upload, path
-                )
-            except Exception as exc:  # noqa: BLE001 - one entry, not the list
-                # inspect_upload promises not to raise; if that promise is ever
-                # broken, the listing still has to come back.
-                decky.logger.error(f"inspecting {path.name} failed: {exc}")
-                status, detail = "error", f"could not be inspected: {exc}"
-            entries.append(
-                {"filename": path.name, "status": status, "detail": detail}
-            )
-        return entries
+    async def _upload_games(self) -> list[dict]:
+        """Games offered by the upload page: managed AND currently installed."""
+        return [
+            {"appid": game["appid"], "name": game["name"]}
+            for game in self.settings.managed_games
+            if self._detect(game["install_dir"]) is not None
+        ]
 
-    async def assign_inbox_entry(
-        self, filename: str, appid: str, mod_name: str
-    ) -> dict:
-        basename = Path(filename).name
-        if not basename:
-            return {"ok": False, "error": "invalid filename"}
-        path = INBOX_DIR / basename
-        if not path.is_file():
-            return {"ok": False, "error": "file no longer in the inbox"}
+    async def _install_upload(self, path: Path, appid: str) -> tuple[bool, str]:
+        """Validate, import and enable one uploaded file for the given game.
+
+        Returns (ok, detail): the mod name on success, a user-facing reason on
+        failure. The uploader shows the detail verbatim on the upload page.
+        """
         game = self._managed_game(appid)
         info = self._detect(game["install_dir"]) if game else None
         if info is None:
-            return {"ok": False, "error": "game is not installed"}
-        name = sanitize_mod_name(mod_name or path.stem)
+            return False, "game is not installed"
+        name = sanitize_mod_name(path.stem)
         try:
             await self._off_loop(self.store.import_mod, appid, info, name, path)
         except StoreError as exc:
-            return {"ok": False, "error": str(exc)}
+            return False, str(exc)
         try:
             await self._off_loop(self.store.set_enabled, appid, info, name, True)
         except StoreError as exc:
-            # The mod is imported and listed; only turning it on failed. The
-            # upload is consumed either way, so it is removed from the inbox
-            # and the user can retry the toggle from the game's mod list.
-            path.unlink(missing_ok=True)
-            return {
-                "ok": False,
-                "error": f"imported, but could not be enabled: {exc}",
-            }
-        path.unlink(missing_ok=True)
-        return {"ok": True, "error": None}
-
-    async def delete_inbox_entry(self, filename: str) -> dict:
-        basename = Path(filename).name
-        if not basename:
-            # Path("some/dir/").name is "", which would unlink the inbox itself.
-            return {"ok": False, "error": "invalid filename"}
-        (INBOX_DIR / basename).unlink(missing_ok=True)
-        return {"ok": True, "error": None}
+            # The mod is imported and listed in the panel, only the enable
+            # failed; the toggle can be retried from the game's mod list.
+            return False, f'imported as "{name}" but could not be enabled: {exc}'
+        return True, name
 
     # -- uploader ------------------------------------------------------------
 
@@ -235,8 +203,10 @@ class Plugin:
             await decky.emit("moddock_upload")
 
         return UploadServer(
-            inbox=INBOX_DIR,
+            staging=STAGING_DIR,
             port=self.settings.upload_port,
+            installer=self._install_upload,
+            games_provider=self._upload_games,
             on_upload=notify,
         )
 

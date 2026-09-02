@@ -25,12 +25,6 @@ export interface ModsResponse {
   mods: ModEntry[];
 }
 
-export interface InboxEntry {
-  filename: string;
-  status: "ready" | "error";
-  detail: string;
-}
-
 export interface OpResult {
   ok: boolean;
   error: string | null;
@@ -59,13 +53,6 @@ export const setModEnabled =
   );
 export const deleteMod =
   callable<[appid: string, mod_name: string], OpResult>("delete_mod");
-export const listInbox = callable<[], InboxEntry[]>("list_inbox");
-export const assignInboxEntry =
-  callable<[filename: string, appid: string, mod_name: string], OpResult>(
-    "assign_inbox_entry",
-  );
-export const deleteInboxEntry =
-  callable<[filename: string], OpResult>("delete_inbox_entry");
 export const setUploader =
   callable<[enabled: boolean], UploaderStatus>("set_uploader");
 export const getUploaderStatus =

@@ -4,6 +4,9 @@ import types
 import zipfile
 from pathlib import Path
 
+import aiohttp
+from aiohttp.test_utils import TestClient, TestServer
+
 
 def free_port() -> int:
     """Reserve-then-release an ephemeral port for a real bind."""
@@ -42,9 +45,6 @@ def test_plugin_imports_and_has_callables(tmp_path):
         "list_mods",
         "set_mod_enabled",
         "delete_mod",
-        "list_inbox",
-        "assign_inbox_entry",
-        "delete_inbox_entry",
         "set_uploader",
         "get_uploader_status",
         "set_upload_port",
@@ -52,6 +52,9 @@ def test_plugin_imports_and_has_callables(tmp_path):
         "_unload",
     ):
         assert hasattr(plugin, method), method
+    # The inbox era is over: uploads install directly.
+    for gone in ("list_inbox", "assign_inbox_entry", "delete_inbox_entry"):
+        assert not hasattr(plugin, gone), gone
 
 
 def _import_main(tmp_path):
@@ -60,25 +63,6 @@ def _import_main(tmp_path):
     import importlib
 
     return importlib.import_module("main")
-
-
-async def test_list_inbox_reports_per_file_status(tmp_path, monkeypatch):
-    main = _import_main(tmp_path)
-    inbox = tmp_path / "inbox"
-    inbox.mkdir()
-    # A bare .pak is a valid classic mod; .rar is accepted into the inbox only
-    # so the inbox can explain that it is unsupported.
-    (inbox / "good.pak").write_bytes(b"pak")
-    (inbox / "nope.rar").write_bytes(b"rar")
-    monkeypatch.setattr("main.INBOX_DIR", inbox)
-
-    entries = await main.Plugin().list_inbox()
-
-    assert [e["filename"] for e in entries] == ["good.pak", "nope.rar"]
-    assert entries[0]["status"] == "ready"
-    assert "1 mod file(s)" in entries[0]["detail"]
-    assert entries[1]["status"] == "error"
-    assert "unsupported format" in entries[1]["detail"]
 
 
 def _ue_tree(tmp_path) -> Path:
@@ -102,142 +86,120 @@ def _wired_plugin(main, tmp_path, monkeypatch):
     from moddock.store import ModStore
 
     base = tmp_path / "base"
-    inbox = base / "inbox"
-    inbox.mkdir(parents=True)
+    staging = base / "staging"
+    staging.mkdir(parents=True)
     monkeypatch.setattr("main.BASE_DIR", base)
-    monkeypatch.setattr("main.INBOX_DIR", inbox)
+    monkeypatch.setattr("main.STAGING_DIR", staging)
     plugin = main.Plugin()
     plugin.settings = Settings(tmp_path / "settings.json")
     plugin.store = ModStore(base)
     plugin.uploader = None
-    return plugin, inbox
+    return plugin, staging
 
 
-async def test_list_inbox_survives_undecryptable_entry(tmp_path, monkeypatch):
-    """One unreadable upload must not take down the whole listing."""
-    from tests.test_importer import _make_encrypted_zip
-
+async def test_upload_games_lists_only_installed(tmp_path, monkeypatch):
     main = _import_main(tmp_path)
-    inbox = tmp_path / "inbox"
-    inbox.mkdir()
-    _make_encrypted_zip(inbox / "locked.zip")
-    _mod_zip(inbox / "ok.zip")
-    monkeypatch.setattr("main.INBOX_DIR", inbox)
-
-    entries = {e["filename"]: e for e in await main.Plugin().list_inbox()}
-
-    assert entries["locked.zip"]["status"] == "error"
-    assert entries["ok.zip"]["status"] == "ready"
-
-
-async def test_list_inbox_isolates_an_inspection_crash(tmp_path, monkeypatch):
-    main = _import_main(tmp_path)
-    inbox = tmp_path / "inbox"
-    inbox.mkdir()
-    (inbox / "boom.pak").write_bytes(b"pak")
-    monkeypatch.setattr("main.INBOX_DIR", inbox)
-
-    def explode(_path):
-        raise RuntimeError("inspector exploded")
-
-    monkeypatch.setattr("main.inspect_upload", explode)
-    [entry] = await main.Plugin().list_inbox()
-    assert entry["status"] == "error"
-    assert "could not be inspected" in entry["detail"]
-
-
-async def test_list_inbox_skips_staging_files(tmp_path, monkeypatch):
-    main = _import_main(tmp_path)
-    inbox = tmp_path / "inbox"
-    inbox.mkdir()
-    (inbox / "good.pak").write_bytes(b"pak")
-    (inbox / "half.zip.part").write_bytes(b"partial")
-    monkeypatch.setattr("main.INBOX_DIR", inbox)
-
-    entries = await main.Plugin().list_inbox()
-    assert [e["filename"] for e in entries] == ["good.pak"]
-
-
-async def test_delete_inbox_entry_rejects_empty_name(tmp_path, monkeypatch):
-    main = _import_main(tmp_path)
-    inbox = tmp_path / "inbox"
-    inbox.mkdir()
-    monkeypatch.setattr("main.INBOX_DIR", inbox)
-
-    for bad in ("", "/", "."):
-        result = await main.Plugin().delete_inbox_entry(bad)
-        assert result == {"ok": False, "error": "invalid filename"}, bad
-    assert inbox.is_dir()
-
-
-async def test_assign_reports_enable_failure_but_clears_inbox(
-    tmp_path, monkeypatch
-):
-    main = _import_main(tmp_path)
-    plugin, inbox = _wired_plugin(main, tmp_path, monkeypatch)
+    plugin, _staging = _wired_plugin(main, tmp_path, monkeypatch)
     install = _ue_tree(tmp_path)
-    await plugin.add_game("1", "SB", str(install))
-    _mod_zip(inbox / "mod.zip")
-
-    from moddock.store import StoreError
-
-    def refuse(*args, **kwargs):
-        raise StoreError("no space left on device")
-
-    monkeypatch.setattr(plugin.store, "set_enabled", refuse)
-    result = await plugin.assign_inbox_entry("mod.zip", "1", "Scarlet")
-
-    assert result["ok"] is False
-    assert "could not be enabled" in result["error"]
-    assert not (inbox / "mod.zip").exists()
-    assert [m["name"] for m in await_mods(plugin)] == ["Scarlet"]
-
-
-def await_mods(plugin):
-    """Synchronous peek at the store, avoiding another await in assertions."""
-    return plugin.store.list_mods("1", None)
-
-
-async def test_end_to_end_inbox_to_delete(tmp_path, monkeypatch):
-    """The whole v1 happy path: upload -> assign -> toggle -> delete."""
-    main = _import_main(tmp_path)
-    plugin, inbox = _wired_plugin(main, tmp_path, monkeypatch)
-    install = _ue_tree(tmp_path)
-    _mod_zip(inbox / "ScarletHead.zip")
-
-    [entry] = await plugin.list_inbox()
-    assert (entry["filename"], entry["status"]) == ("ScarletHead.zip", "ready")
-
     await plugin.add_game("1", "Stellar Blade", str(install))
-    assert [g["appid"] for g in await plugin.get_managed_games()] == ["1"]
+    await plugin.add_game("2", "Gone Game", str(tmp_path / "nowhere"))
 
-    assert await plugin.assign_inbox_entry("ScarletHead.zip", "1", "Scarlet") == {
-        "ok": True,
-        "error": None,
-    }
-    assert not (inbox / "ScarletHead.zip").exists()
+    assert await plugin._upload_games() == [
+        {"appid": "1", "name": "Stellar Blade"}
+    ]
+
+
+async def test_install_upload_end_to_end(tmp_path, monkeypatch):
+    """The whole flow: upload file -> import -> enabled -> toggle -> delete."""
+    main = _import_main(tmp_path)
+    plugin, staging = _wired_plugin(main, tmp_path, monkeypatch)
+    install = _ue_tree(tmp_path)
+    await plugin.add_game("1", "Stellar Blade", str(install))
+    upload = _mod_zip(staging / "ScarletHead.zip")
+
+    ok, detail = await plugin._install_upload(upload, "1")
+    assert (ok, detail) == (True, "ScarletHead")
 
     mods = await plugin.list_mods("1")
     assert mods["installed"] is True
-    assert mods["mods"] == [{"name": "Scarlet", "state": "enabled"}]
+    assert mods["mods"] == [{"name": "ScarletHead", "state": "enabled"}]
     mods_dir = install / "SB" / "Content" / "Paks" / "~mods"
     assert (mods_dir / "scarlet.pak").is_file()
+    # The repository keeps its copy while the mod is enabled.
+    repo_pak = tmp_path / "base" / "mods" / "1" / "ScarletHead" / "scarlet.pak"
+    assert repo_pak.is_file()
 
-    assert (await plugin.set_mod_enabled("1", "Scarlet", False))["ok"] is True
-    assert (await plugin.list_mods("1"))["mods"] == [
-        {"name": "Scarlet", "state": "disabled"}
-    ]
+    assert (await plugin.set_mod_enabled("1", "ScarletHead", False))["ok"] is True
     assert not (mods_dir / "scarlet.pak").exists()
+    assert repo_pak.is_file()
 
-    assert (await plugin.delete_mod("1", "Scarlet"))["ok"] is True
+    assert (await plugin.delete_mod("1", "ScarletHead"))["ok"] is True
     assert (await plugin.list_mods("1"))["mods"] == []
+
+
+async def test_install_upload_reports_validation_failure(tmp_path, monkeypatch):
+    main = _import_main(tmp_path)
+    plugin, staging = _wired_plugin(main, tmp_path, monkeypatch)
+    install = _ue_tree(tmp_path)
+    await plugin.add_game("1", "Stellar Blade", str(install))
+    bad = staging / "broken.zip"
+    bad.write_bytes(b"this is not a zip")
+
+    ok, reason = await plugin._install_upload(bad, "1")
+    assert ok is False
+    assert "zip" in reason.lower()
+    assert (await plugin.list_mods("1"))["mods"] == []
+
+
+async def test_install_upload_rejects_missing_game(tmp_path, monkeypatch):
+    main = _import_main(tmp_path)
+    plugin, staging = _wired_plugin(main, tmp_path, monkeypatch)
+    upload = _mod_zip(staging / "mod.zip")
+
+    ok, reason = await plugin._install_upload(upload, "999")
+    assert (ok, reason) == (False, "game is not installed")
+
+
+async def test_http_upload_installs_end_to_end(tmp_path, monkeypatch):
+    """Full stack: HTTP multipart -> uploader -> installer -> store -> ~mods."""
+    main = _import_main(tmp_path)
+    plugin, _staging = _wired_plugin(main, tmp_path, monkeypatch)
+    install = _ue_tree(tmp_path)
+    await plugin.add_game("1", "Stellar Blade", str(install))
+
+    server = plugin._start_uploader()
+    server.token = "testtoken"
+    client = TestClient(TestServer(server.build_app()))
+    await client.start_server()
+    try:
+        games = await (await client.get("/u/testtoken/games")).json()
+        assert games == {"games": [{"appid": "1", "name": "Stellar Blade"}]}
+
+        archive = _mod_zip(tmp_path / "ScarletHead.zip")
+        form = aiohttp.FormData()
+        form.add_field("appid", "1")
+        form.add_field("file", archive.read_bytes(), filename="ScarletHead.zip")
+        resp = await client.post("/u/testtoken", data=form)
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["installed"] == [
+            {"name": "ScarletHead.zip", "mod": "ScarletHead"}
+        ]
+    finally:
+        await client.close()
+
+    mods_dir = install / "SB" / "Content" / "Paks" / "~mods"
+    assert (mods_dir / "scarlet.pak").is_file()
+    assert (await plugin.list_mods("1"))["mods"] == [
+        {"name": "ScarletHead", "state": "enabled"}
+    ]
 
 
 async def test_uploader_status_reports_port_and_survives_qr_failure(
     tmp_path, monkeypatch
 ):
     main = _import_main(tmp_path)
-    plugin, _inbox = _wired_plugin(main, tmp_path, monkeypatch)
+    plugin, _staging = _wired_plugin(main, tmp_path, monkeypatch)
 
     status = await plugin.get_uploader_status()
     assert status["running"] is False
@@ -262,7 +224,7 @@ async def test_uploader_status_reports_port_and_survives_qr_failure(
 
 async def test_set_upload_port_validates_and_persists(tmp_path, monkeypatch):
     main = _import_main(tmp_path)
-    plugin, _inbox = _wired_plugin(main, tmp_path, monkeypatch)
+    plugin, _staging = _wired_plugin(main, tmp_path, monkeypatch)
 
     status = await plugin.set_upload_port(9100)
     assert status["port"] == 9100
@@ -278,7 +240,7 @@ async def test_set_upload_port_restarts_a_running_uploader(
     tmp_path, monkeypatch
 ):
     main = _import_main(tmp_path)
-    plugin, inbox = _wired_plugin(main, tmp_path, monkeypatch)
+    plugin, _staging = _wired_plugin(main, tmp_path, monkeypatch)
 
     started = await plugin.set_uploader(True)
     assert started["running"] is True
