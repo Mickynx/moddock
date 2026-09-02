@@ -186,13 +186,34 @@ def test_ingest_tree_preserves_structure(tmp_path):
     assert (dest / "Mods/My/scripts/main.lua").is_file()
 
 
-def test_ingest_tree_strips_wrapper_dirs(tmp_path):
+def test_ingest_tree_strips_only_one_wrapper_dir(tmp_path):
+    """At most ONE level goes: deeper directories are the mod's own layout."""
     archive = tmp_path / "m.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("Wrapper/Inner/mod.pak", "x")
         zf.writestr("Wrapper/Inner/readme.txt", "x")
     tree = ingest_tree(archive, tmp_path / "repo")
-    assert tree == ["mod.pak", "readme.txt"]
+    assert tree == ["Inner/mod.pak", "Inner/readme.txt"]
+
+
+def test_ingest_tree_keeps_the_layout_under_the_wrapper(tmp_path):
+    """The shape a game-root-merge method needs must survive the strip."""
+    archive = tmp_path / "bep.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("MyMod-1.0/BepInEx/plugins/x.dll", "x")
+    assert ingest_tree(archive, tmp_path / "repo") == ["BepInEx/plugins/x.dll"]
+
+
+def test_ingest_tree_ignores_macosx_metadata(tmp_path):
+    """A zip made on macOS carries a __MACOSX sibling; it is not a second
+    top-level directory, and none of it belongs in the repository."""
+    archive = tmp_path / "mac.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("Wrapper/mod.pak", "x")
+        zf.writestr("__MACOSX/Wrapper/._mod.pak", "x")
+    dest = tmp_path / "repo"
+    assert ingest_tree(archive, dest) == ["mod.pak"]
+    assert not (dest / "__MACOSX").exists()
 
 
 def test_ingest_tree_bare_file(tmp_path):

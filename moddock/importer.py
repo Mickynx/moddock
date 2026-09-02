@@ -21,6 +21,11 @@ from pathlib import Path, PurePosixPath
 MOD_FILE_EXTS = {".pak", ".utoc", ".ucas"}
 ARCHIVE_EXTS = {".zip", ".7z"}
 
+# Resource-fork metadata the macOS Archive Utility adds to a zip. It is never
+# part of the mod, so it is neither ingested nor counted when deciding whether
+# the archive has a single wrapping directory.
+MACOSX_DIR = "__MACOSX"
+
 # Ceiling on what a single archive may expand to. Extraction goes to a scratch
 # directory, so an archive claiming hundreds of gigabytes must be refused before
 # it fills the device (or, worse, RAM when the scratch space is tmpfs-backed).
@@ -151,17 +156,23 @@ def extract_archive(archive: Path, dest: Path) -> None:
         raise ImportProblem(f"unsupported format: {suffix or archive.name}")
 
 
-def _strip_wrappers(root: Path) -> Path:
-    """Descend through single-directory wrappers (the usual packaging shell)."""
-    current = root
-    while True:
-        entries = list(current.iterdir())
-        dirs = [p for p in entries if p.is_dir()]
-        files = [p for p in entries if p.is_file()]
-        if len(dirs) == 1 and not files:
-            current = dirs[0]
-        else:
-            return current
+def _strip_wrapper(root: Path) -> Path:
+    """Strip AT MOST ONE wrapping top-level directory (the packaging shell).
+
+    Only the outermost level is a packaging artefact ("MyMod-1.0/"); anything
+    below it is the mod's own layout and must survive — `MyMod-1.0/BepInEx/
+    plugins/x.dll` has to stay `BepInEx/plugins/x.dll` for a game-root-merge
+    method to land it correctly. Descending further would flatten exactly the
+    structure such a method needs.
+
+    A `__MACOSX` sibling (metadata a zip made on macOS carries) does not count
+    as a second entry: it would otherwise defeat the strip.
+    """
+    entries = [p for p in root.iterdir() if p.name != MACOSX_DIR]
+    dirs = [p for p in entries if p.is_dir()]
+    if len(dirs) == 1 and not any(p.is_file() for p in entries):
+        return dirs[0]
+    return root
 
 
 def ingest_tree(source: Path, dest: Path) -> list[str]:
@@ -178,14 +189,18 @@ def ingest_tree(source: Path, dest: Path) -> list[str]:
             workdir = Path(tmp)
             if source.suffix.lower() in ARCHIVE_EXTS:
                 extract_archive(source, workdir)
-                root = _strip_wrappers(workdir)
+                root = _strip_wrapper(workdir)
             else:
                 shutil.copy2(source, workdir / source.name)
                 root = workdir
             files = sorted(
-                p.relative_to(root).as_posix()
-                for p in root.rglob("*")
-                if p.is_file()
+                rel
+                for rel in (
+                    p.relative_to(root).as_posix()
+                    for p in root.rglob("*")
+                    if p.is_file()
+                )
+                if MACOSX_DIR not in PurePosixPath(rel).parts
             )
             if not files:
                 raise ImportProblem("the archive contains no files")
