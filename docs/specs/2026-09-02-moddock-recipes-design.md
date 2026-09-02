@@ -133,14 +133,27 @@ entry stays legacy-flagged and read-only until the game is detected.
    - `refuse` rules: at import AND at enable, a `dst` that exists but is
      not claimed by this mod fails with a message telling the user to
      remove the foreign file by hand.
-   - `backup` rules: at enable, an existing unmanaged `dst` is moved to
-     `~/.local/share/moddock/backup/<appid>/<dst>` before the copy.
-     Disable and delete restore the backup (move it back) instead of just
-     unlinking. A backup is taken at most once per `dst` (the first enable
-     preserves the true original). Documented caveat: if the game updated
-     that file while the mod was enabled, the restored original is
-     outdated — verify game files in Steam. Backups are real files, never
-     links.
+   - `backup` rules: at enable, an existing `dst` is moved to
+     `~/.local/share/moddock/backup/<appid>/<dst>` before the copy, and the
+     deploy item records a persisted `"displaced": true` flag (provenance
+     about the game's original file, not derived enable-state). Disable and
+     delete restore the backup (move it back) instead of just unlinking;
+     for a displaced item whose backup is absent, recall is a NO-OP — the
+     restored original is already in place and must never be unlinked
+     (this is what makes repeated disable/delete safe). State for a
+     displaced item: it counts as deployed iff its backup file exists AND
+     the `dst` file exists; never-displaced backup items use plain `dst`
+     presence. A backup is re-taken whenever `dst` exists with no parked
+     backup (covers re-enable after a restore). Documented caveat: if the
+     game updated that file while the mod was enabled, the restored
+     original is outdated — verify game files in Steam. Backups are real
+     files, never links.
+   - Clarification on "refuse at enable": the enable-time guarantee is
+     ownership via the claim map — every `dst` in a mod's deploy list was
+     verified unclaimed and unoccupied at import, so enable may overwrite
+     freely at its own claimed paths; that is what makes enable an
+     idempotent repair. The import-time check is where foreign files are
+     refused.
 
 ## 5. Import Pipeline (per upload)
 
