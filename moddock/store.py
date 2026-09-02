@@ -291,63 +291,93 @@ class ModStore:
                         f'the stored copy of "{missing}" is missing — delete '
                         "the mod and import it again"
                     )
-                displaced = False
+                changed = False
                 for item in deploy:
                     dst_abs = game.install_dir / item["dst"]
                     dst_abs.parent.mkdir(parents=True, exist_ok=True)
-                    backup = self._backup_path(appid, item["dst"])
-                    # A backup is taken whenever a file we did not deploy sits
-                    # at the destination and nothing is parked yet — on the
-                    # first enable, and again after a disable put the game's
-                    # original back. An existing backup is never overwritten,
-                    # so a re-enable cannot bury the true original under our
-                    # own copy.
-                    if (
-                        item.get("overwrite") == "backup"
-                        and dst_abs.exists()
-                        and not backup.exists()
-                    ):
-                        backup.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(dst_abs), str(backup))
-                        # Persisted provenance about the GAME's file, not
-                        # derived enable-state: it records that this
-                        # destination once held something of the game's that
-                        # we must never unlink. Enable-state stays derived
-                        # from the filesystem.
-                        item["displaced"] = True
-                        displaced = True
+                    if item.get("overwrite") == "backup":
+                        changed |= self._park_original(appid, item, dst_abs)
                     # Overwriting is safe: the import-time claim map and the
                     # refuse check ensure any file already at this path is
                     # ModDock's own (possibly stale) copy, so enable doubles
                     # as repair and is idempotent.
                     shutil.copy2(repo / item["src"], dst_abs)
-                if displaced and "deploy" in entry:
-                    self._save_manifest(appid, manifest)
             else:
+                changed = False
                 for item in deploy:
-                    self._recall(appid, game, item)
+                    changed |= self._recall(appid, game, item)
+            if changed and "deploy" in entry:
+                self._save_manifest(appid, manifest)
         except OSError as exc:
             raise StoreError(str(exc)) from exc
 
-    def _recall(self, appid: str, game: UEGameInfo, item: dict) -> None:
+    def _park_original(self, appid: str, item: dict, dst_abs: Path) -> bool:
+        """Move a `backup` item's pre-existing destination file out of the way.
+
+        Also re-decides the item's `displaced` flag, which is persisted
+        provenance about the GAME's own file rather than derived enable-state:
+        it records that this destination holds something of the game's that we
+        must never unlink. Three states, checked in this order:
+
+        - a backup is already parked -> the original is safe; never overwrite
+          it (that would bury the true original under our own copy), flag on;
+        - nothing parked but the destination is occupied -> that file is the
+          game's, park it, flag on. This covers the first enable and every
+          re-enable after a disable put the original back;
+        - nothing parked and nothing at the destination -> there is nothing
+          left to protect, flag off. The item degrades to fresh-path
+          semantics, so a later disable removes our copy normally.
+
+        Returns whether the flag changed and the manifest needs saving.
+        """
+        backup = self._backup_path(appid, item["dst"])
+        if backup.exists():
+            displaced = True
+        elif dst_abs.exists():
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(dst_abs), str(backup))
+            displaced = True
+        else:
+            displaced = False
+        if bool(item.get("displaced")) == displaced:
+            return False
+        item["displaced"] = displaced
+        return True
+
+    def _recall(self, appid: str, game: UEGameInfo, item: dict) -> bool:
         """Undo one deployed item: restore the backup, or just remove ours.
+
+        The parked backup FILE is the first authority, ahead of the flag: the
+        move that parks it necessarily happens before the manifest can record
+        it, so a crash in that window leaves a real original with no flag
+        pointing at it. Whenever a backup file exists it goes back, and the
+        flag is repaired on the way so the next recall knows.
+
+        With no backup parked, the flag decides: an item that displaced
+        something has already had its original restored by an earlier recall
+        and must be left alone, while any other item's destination holds our
+        own copy and is unlinked.
 
         Only the file itself is touched — directories are left in place
         because they are shared with the game and with other mods.
+
+        Returns whether the flag changed and the manifest needs saving.
         """
         dst_abs = game.install_dir / item["dst"]
         backup = self._backup_path(appid, item["dst"])
-        if item.get("overwrite") == "backup" and item.get("displaced"):
+        if item.get("overwrite") == "backup":
             if backup.is_file():
                 dst_abs.unlink(missing_ok=True)
                 dst_abs.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(backup), str(dst_abs))
-            # No backup parked means the original is already back at the
-            # destination (an earlier disable restored it). Unlinking here
-            # would destroy the game's own file, so this is a no-op — which
-            # is what makes disable and delete safely repeatable.
-            return
+                if item.get("displaced"):
+                    return False
+                item["displaced"] = True
+                return True
+            if item.get("displaced"):
+                return False  # the original is already back; never unlink it
         dst_abs.unlink(missing_ok=True)
+        return False
 
     def delete_mod(
         self, appid: str, game: UEGameInfo | None, mod_name: str

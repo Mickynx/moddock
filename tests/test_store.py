@@ -287,6 +287,56 @@ def test_displaced_backup_item_is_disabled_after_game_reinstall(tmp_path):
     assert store.list_mods("1", reinstalled)[0]["state"] == "enabled"
 
 
+def _deploy_items(tmp_path: Path, mod_name: str = "Replacer") -> list[dict]:
+    path = tmp_path / "base" / "manifest" / "1.json"
+    return json.loads(path.read_text())["mods"][mod_name]["deploy"]
+
+
+def test_stranded_backup_is_restored_even_with_the_flag_lost(tmp_path):
+    """A parked backup file outranks the flag that should have recorded it.
+
+    Enable moves the original aside before it can persist `displaced`, so a
+    crash in that window (ENOSPC on the copy, a later item, the manifest
+    write) leaves the vanilla file parked with nothing pointing at it.
+    Recall must still put it back rather than unlink the destination.
+    """
+    store, game, original, backup = _replacer(tmp_path)
+    store.set_enabled("1", game, "Replacer", True)
+    assert backup.read_bytes() == b"vanilla"
+
+    path = tmp_path / "base" / "manifest" / "1.json"
+    manifest = json.loads(path.read_text())
+    for item in manifest["mods"]["Replacer"]["deploy"]:
+        item.pop("displaced", None)
+    path.write_text(json.dumps(manifest))
+
+    store.set_enabled("1", game, "Replacer", False)
+    assert original.read_bytes() == b"vanilla"  # restored, not unlinked
+    assert not backup.exists()
+
+    store.delete_mod("1", game, "Replacer")
+    assert original.read_bytes() == b"vanilla"
+    assert store.list_mods("1", game) == []
+
+
+def test_reenable_after_the_original_vanished_clears_the_flag(tmp_path):
+    """With nothing left to protect, the item degrades to fresh-path semantics."""
+    store, game, original, backup = _replacer(tmp_path)
+    store.set_enabled("1", game, "Replacer", True)
+    store.set_enabled("1", game, "Replacer", False)
+    original.unlink()  # the user removed the restored original by hand
+
+    store.set_enabled("1", game, "Replacer", True)
+    [item] = _deploy_items(tmp_path)
+    assert item.get("displaced", False) is False
+    assert original.read_bytes() == b"modded"
+    assert store.list_mods("1", game)[0]["state"] == "enabled"
+
+    # Our own copy is now unlinked normally instead of being protected.
+    store.set_enabled("1", game, "Replacer", False)
+    assert not original.exists()
+
+
 def test_backup_item_that_displaced_nothing_toggles_normally(tmp_path):
     """A backup-mode file with no pre-existing original behaves like any other."""
     store, game, original, backup = _replacer(tmp_path, vanilla=False)
