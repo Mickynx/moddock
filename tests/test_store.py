@@ -268,6 +268,25 @@ def test_reenable_after_disable_backs_the_original_up_again(tmp_path):
     assert store.list_mods("1", game)[0]["state"] == "enabled"
 
 
+def test_displaced_backup_item_is_disabled_after_game_reinstall(tmp_path):
+    """A parked backup outlives the game; the deployed file does not."""
+    store, game, original, backup = _replacer(tmp_path)
+    store.set_enabled("1", game, "Replacer", True)
+    assert store.list_mods("1", game)[0]["state"] == "enabled"
+
+    shutil.rmtree(game.install_dir)
+    reinstalled = _game(tmp_path)
+    assert backup.read_bytes() == b"vanilla"  # the backup survived
+    assert store.list_mods("1", reinstalled)[0]["state"] == "disabled"
+
+    store.set_enabled("1", reinstalled, "Replacer", True)
+    deployed = reinstalled.install_dir / "SB" / "original.dll"
+    assert deployed.read_bytes() == b"modded"
+    # The parked original is never re-backed-up over by our own copy.
+    assert backup.read_bytes() == b"vanilla"
+    assert store.list_mods("1", reinstalled)[0]["state"] == "enabled"
+
+
 def test_backup_item_that_displaced_nothing_toggles_normally(tmp_path):
     """A backup-mode file with no pre-existing original behaves like any other."""
     store, game, original, backup = _replacer(tmp_path, vanilla=False)

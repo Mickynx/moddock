@@ -141,12 +141,16 @@ class ModStore:
 
         For an item that displaced one of the game's own files, presence at
         the destination proves nothing — after a disable the game's restored
-        original occupies exactly that path. The backup is the witness
-        instead: it exists only while our copy is deployed over it.
+        original occupies exactly that path. The parked backup is the second
+        witness: it exists only while our copy is deployed over it. Both are
+        required, because a backup outlives the game it was taken from — after
+        an uninstall/reinstall it is still parked while the deployed file went
+        with the old install dir.
         """
+        deployed = (game.install_dir / item["dst"]).is_file()
         if item.get("overwrite") == "backup" and item.get("displaced"):
-            return self._backup_path(appid, item["dst"]).is_file()
-        return (game.install_dir / item["dst"]).is_file()
+            return deployed and self._backup_path(appid, item["dst"]).is_file()
+        return deployed
 
     # -- operations --------------------------------------------------------
 
