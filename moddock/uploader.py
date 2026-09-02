@@ -90,6 +90,11 @@ const OVERWRITES=['refuse','backup'];
 const LEFTOVERS=['ignore','fail'];
 // The games payload, kept so a rule row can grey out anchors this game lacks.
 let games=[];
+// localStorage throws outright in a private window or with site data blocked,
+// which would abort the upload the moment we remember a choice. Remembering is
+// a convenience; losing it must never cost the upload.
+function lsGet(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
 function option(value,text){
   const o=document.createElement('option');
   o.value=value; o.textContent=text;
@@ -124,7 +129,7 @@ async function loadGames(){
     }
     games=j.games;
     for(const g of j.games) sel.appendChild(option(g.appid,g.name));
-    const last=localStorage.getItem('moddock_appid');
+    const last=lsGet('moddock_appid');
     if(last && [...sel.options].some(o=>o.value===last)) sel.value=last;
     for(const rc of (j.recipes||[])) rsel.appendChild(option(rc.id,rc.name));
     rsel.appendChild(option(NEW,'+ New install method…'));
@@ -138,7 +143,7 @@ async function loadGames(){
 function restoreRecipe(){
   // Each game remembers its own install method; an id that no longer exists
   // (recipe deleted since) falls back to the built-in default.
-  const want=localStorage.getItem('moddock_recipe_'+sel.value)||DEFAULT_RECIPE;
+  const want=lsGet('moddock_recipe_'+sel.value)||DEFAULT_RECIPE;
   const usable=[...rsel.options].filter(o=>o.value!==NEW);
   if(usable.some(o=>o.value===want)) rsel.value=want;
   else if(usable.length) rsel.value=usable[0].value;
@@ -242,8 +247,8 @@ async function saveRecipe(){
     }
     // Remember both before reloading, so the refreshed lists come back on the
     // same game with the freshly created method selected.
-    localStorage.setItem('moddock_appid',sel.value);
-    localStorage.setItem('moddock_recipe_'+sel.value,j.id);
+    lsSet('moddock_appid',sel.value);
+    lsSet('moddock_recipe_'+sel.value,j.id);
     await loadGames();
     if([...rsel.options].some(o=>o.value===j.id)) rsel.value=j.id;
     toggleForm();
@@ -300,8 +305,8 @@ async function up(){
     hint.textContent='Pick an install method first — or save the new one you are creating.';
     return;
   }
-  localStorage.setItem('moddock_appid',appid);
-  localStorage.setItem('moddock_recipe_'+appid,recipe);
+  lsSet('moddock_appid',appid);
+  lsSet('moddock_recipe_'+appid,recipe);
   btn.disabled=true;
   items.textContent='';
   for(const f of files){ await sendOne(f,appid,recipe,row(f.name)); }

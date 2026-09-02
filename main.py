@@ -133,7 +133,10 @@ class Plugin:
     async def list_mods(self, appid: str) -> dict:
         game = self._managed_game(appid)
         info = self._detect(game["install_dir"]) if game else None
-        mods = self.store.list_mods(appid, info)
+        # Listing stats every deploy destination — on a cold SD card that is
+        # seconds of blocking I/O, so it goes off the loop like every other
+        # store call.
+        mods = await self._off_loop(self.store.list_mods, appid, info)
         return {
             "installed": info is not None,
             "running_hint": False,
