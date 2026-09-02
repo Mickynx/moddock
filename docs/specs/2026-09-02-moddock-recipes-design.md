@@ -115,11 +115,20 @@ The manifest entry generalizes from a flat file list to a deploy list:
 - Enabled state remains derived from the filesystem: all `dst` present →
   enabled; some → partial; none → disabled. `game is None` → disabled.
 
-Legacy v1 manifests (a flat `files` list + `repo`) are migrated on first
-load: each file becomes `{"src": f, "dst": "<project>/Content/Paks/~mods/" + f,
-"overwrite": "refuse"}` with recipe `ue-paks-mods` — the project segment is
-recovered from the game's detection info when available, otherwise the
-entry stays legacy-flagged and read-only until the game is detected.
+Legacy v1 manifests (a flat `files` list + `repo`) are migrated in place
+the first time any operation runs with a detected game: each file becomes
+`{"src": f, "dst": "<project>/Content/Paks/~mods/" + f, "overwrite":
+"refuse"}` with recipe `ue-paks-mods`, and — critically for data from the
+brief move-semantics era — the v2 store is made the full copy FIRST: a
+file missing from the store is copied (never moved, so an interrupted
+migration is simply re-run) from the entry's recorded legacy repo path
+(which covers v1's SD-card `.moddock` relocation) or harvested back from
+the game's `~mods` directory (the move-era enabled case, where the
+deployed file is the only copy). Files found nowhere migrate as-is and
+enable fails with the explicit missing-store-copy message. Without a
+detected game the entry stays legacy and a read-time synthesis keeps it
+listable and repo-side deletable; a rollback to v1 keeps working for
+entries migration has not touched.
 
 ## 4. Safety Model (three layers)
 

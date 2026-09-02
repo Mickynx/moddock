@@ -611,3 +611,111 @@ def test_legacy_v1_manifest_still_works(tmp_path):
     store.set_enabled("1", game, "Old", False)
     store.delete_mod("1", game, "Old")
     assert store.list_mods("1", game) == []
+
+
+def _legacy_entry(files, repo):
+    return {
+        "files": files,
+        "source": "old.zip",
+        "imported_at": "2026-09-01T00:00:00+00:00",
+        "repo": str(repo),
+    }
+
+
+def _write_manifest(base: Path, appid: str, mods: dict) -> None:
+    (base / "manifest").mkdir(parents=True, exist_ok=True)
+    (base / "manifest" / f"{appid}.json").write_text(json.dumps({"mods": mods}))
+
+
+def test_migration_rescues_move_era_enabled_mod(tmp_path):
+    """v1.0 (move semantics) kept an ENABLED mod's files only in ~mods, with
+    an empty repository. Migration must copy them back into the store before
+    any disable can unlink the only copy."""
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    game.mods_dir.mkdir(parents=True)
+    for ext in ("pak", "utoc", "ucas"):
+        (game.mods_dir / f"old.{ext}").write_bytes(b"movedata")
+    repo = tmp_path / "base" / "mods" / "1" / "Old"
+    repo.mkdir(parents=True)  # v1.0 move semantics: enabled -> repo is empty
+    _write_manifest(tmp_path / "base", "1", {"Old": _legacy_entry(
+        ["old.pak", "old.utoc", "old.ucas"], repo)})
+
+    [mod] = store.list_mods("1", game)
+    assert mod["state"] == "enabled"
+    # The store now holds the full copy, harvested from ~mods.
+    assert (repo / "old.pak").read_bytes() == b"movedata"
+    # The entry was rewritten to the v2 deploy format on disk.
+    on_disk = json.loads(
+        (tmp_path / "base" / "manifest" / "1.json").read_text()
+    )
+    assert "deploy" in on_disk["mods"]["Old"]
+    assert "files" not in on_disk["mods"]["Old"]
+
+    # The formerly lethal sequence: disable no longer destroys the only copy.
+    store.set_enabled("1", game, "Old", False)
+    assert not (game.mods_dir / "old.pak").exists()
+    assert (repo / "old.pak").read_bytes() == b"movedata"
+    store.set_enabled("1", game, "Old", True)
+    assert (game.mods_dir / "old.pak").read_bytes() == b"movedata"
+
+
+def test_migration_recovers_files_from_v1_relocated_repo(tmp_path):
+    """v1.0 relocated a game-on-another-drive repo to <library>/.moddock/...;
+    migration honors the entry's stored repo path and copies the files into
+    the v2 store location."""
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    old_repo = tmp_path / "sdcard" / ".moddock" / "1" / "Old"
+    old_repo.mkdir(parents=True)
+    for ext in ("pak", "utoc", "ucas"):
+        (old_repo / f"old.{ext}").write_bytes(b"sdcarddata")
+    _write_manifest(tmp_path / "base", "1", {"Old": _legacy_entry(
+        ["old.pak", "old.utoc", "old.ucas"], old_repo)})
+
+    [mod] = store.list_mods("1", game)
+    assert mod["state"] == "disabled"
+    new_repo = tmp_path / "base" / "mods" / "1" / "Old"
+    assert (new_repo / "old.pak").read_bytes() == b"sdcarddata"
+    # Copied, not moved: the old location is left for the user to clean.
+    assert (old_repo / "old.pak").is_file()
+
+    store.set_enabled("1", game, "Old", True)
+    assert (game.mods_dir / "old.pak").read_bytes() == b"sdcarddata"
+
+
+def test_migration_with_missing_files_degrades_loudly(tmp_path):
+    """A legacy file found nowhere migrates as-is; enable then fails with the
+    explicit missing-store-copy message instead of half-deploying."""
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    _write_manifest(tmp_path / "base", "1", {"Old": _legacy_entry(
+        ["gone.pak"], tmp_path / "base" / "mods" / "1" / "Old")})
+
+    [mod] = store.list_mods("1", game)
+    assert mod["state"] == "disabled"
+    with pytest.raises(StoreError) as excinfo:
+        store.set_enabled("1", game, "Old", True)
+    assert "gone.pak" in str(excinfo.value)
+    store.delete_mod("1", game, "Old")
+    assert store.list_mods("1", game) == []
+
+
+def test_migration_is_idempotent_and_skipped_without_game(tmp_path):
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    repo = tmp_path / "base" / "mods" / "1" / "Old"
+    repo.mkdir(parents=True)
+    (repo / "old.pak").write_bytes(b"x")
+    _write_manifest(tmp_path / "base", "1", {"Old": _legacy_entry(
+        ["old.pak"], repo)})
+
+    # Without a detected game nothing is rewritten.
+    store.list_mods("1", None)
+    on_disk = json.loads((tmp_path / "base" / "manifest" / "1.json").read_text())
+    assert "files" in on_disk["mods"]["Old"]
+
+    store.list_mods("1", game)
+    first = (tmp_path / "base" / "manifest" / "1.json").read_text()
+    store.list_mods("1", game)
+    assert (tmp_path / "base" / "manifest" / "1.json").read_text() == first

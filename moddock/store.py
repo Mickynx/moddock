@@ -114,18 +114,82 @@ class ModStore:
                     "the mod and import it again"
                 )
 
+    def _ensure_migrated(
+        self, appid: str, manifest: dict, game: UEGameInfo | None, *, strict: bool
+    ) -> None:
+        """Upgrade legacy v1 entries to the deploy-list format, in place.
+
+        v1's move semantics kept an ENABLED mod's files only in ~mods (the
+        repository was empty), and its SD-card handling could relocate the
+        repository to <library>/.moddock/... — both shapes would lose files
+        under v2's copy-semantics operations. Migration makes the v2 store
+        the full copy before anything else can run:
+
+        - a file already in the v2 repository is left alone;
+        - else it is copied (never moved, so an interrupted run can simply
+          be repeated) from the entry's recorded legacy repo path;
+        - else it is harvested back from the game's ~mods directory (the
+          move-era enabled case — the deployed file IS the only copy).
+
+        Files found nowhere migrate as-is; enable later fails with the
+        explicit missing-store-copy message. Needs a detected game for the
+        anchors and the ~mods harvest; without one the entry stays legacy
+        and the read-time synthesis below keeps it usable. A per-entry
+        failure leaves that entry legacy rather than half-rewritten. The
+        manifest is saved once when anything changed; with strict=False
+        (listing paths) a failing save is retried on the next call instead
+        of failing the operation.
+        """
+        if game is None or game.install_dir is None:
+            return
+        changed = False
+        for mod_name, entry in sorted(manifest["mods"].items()):
+            if "deploy" in entry or "files" not in entry:
+                continue
+            new_repo = self._mod_repo_dir(appid, mod_name)
+            old_repo = Path(entry.get("repo") or new_repo)
+            paks_rel = game.anchor_map()["paks_dir"]
+            try:
+                items = []
+                for f in entry["files"]:
+                    dst = f"{paks_rel}/{MODS_DIR_NAME}/{f}"
+                    stored = new_repo / f
+                    if not stored.is_file():
+                        if old_repo != new_repo and (old_repo / f).is_file():
+                            stored.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(old_repo / f, stored)
+                        elif (game.install_dir / dst).is_file():
+                            stored.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(game.install_dir / dst, stored)
+                    items.append({"src": f, "dst": dst, "overwrite": "refuse"})
+            except OSError:
+                continue  # leave this entry legacy; synthesis still covers it
+            manifest["mods"][mod_name] = {
+                "recipe": "ue-paks-mods",
+                "recipe_name": "UE ~mods (pak)",
+                "deploy": items,
+                "source": entry.get("source", ""),
+                "imported_at": entry.get("imported_at", ""),
+            }
+            changed = True
+        if changed:
+            try:
+                self._save_manifest(appid, manifest)
+            except OSError as exc:
+                if strict:
+                    raise StoreError(str(exc)) from exc
+
     def _entry_deploy(
         self, mod_name: str, entry: dict, game: UEGameInfo | None
     ) -> list[dict] | None:
         """Deploy items for an entry; synthesizes them for legacy v1 entries.
 
-        v1 manifests recorded a flat "files" list and always installed into
-        the game's ~mods directory. That is exactly what the ue-paks-mods
-        recipe produces, so the equivalent deploy list can be reconstructed
-        on the fly from the game's anchors — no migration pass, and a
-        rollback to v1 keeps working. Without a detected game there are no
-        anchors to resolve against, so such an entry is unusable (repo-side
-        delete still works).
+        Legacy entries are normally upgraded by _ensure_migrated before any
+        operation runs; this synthesis is the fallback for the cases
+        migration cannot reach (no detected game, or a migration copy
+        failed), so such an entry stays listable and repo-side delete keeps
+        working. A rollback to v1 also keeps working for entries migration
+        has not touched yet.
 
         Raises StoreError for an entry whose destinations are not usable.
         """
@@ -193,6 +257,7 @@ class ModStore:
     ) -> dict:
         mod_name = sanitize_mod_name(mod_name)
         manifest = self._load_manifest(appid)
+        self._ensure_migrated(appid, manifest, game, strict=True)
         if mod_name in manifest["mods"]:
             raise StoreError(f'a mod named "{mod_name}" already exists')
         # Resolved before anything is written, so a game that cannot supply
@@ -262,6 +327,7 @@ class ModStore:
 
     def list_mods(self, appid: str, game: UEGameInfo | None) -> list[dict]:
         manifest = self._load_manifest(appid)
+        self._ensure_migrated(appid, manifest, game, strict=False)
         mods: list[dict] = []
         for name, entry in sorted(manifest["mods"].items()):
             try:
@@ -299,6 +365,7 @@ class ModStore:
         self, appid: str, game: UEGameInfo, mod_name: str, enabled: bool
     ) -> None:
         manifest = self._load_manifest(appid)
+        self._ensure_migrated(appid, manifest, game, strict=True)
         entry = manifest["mods"].get(mod_name)
         if entry is None:
             raise StoreError(f'unknown mod "{mod_name}"')
@@ -448,12 +515,13 @@ class ModStore:
         self, appid: str, game: UEGameInfo | None, mod_name: str
     ) -> None:
         manifest = self._load_manifest(appid)
-        entry = manifest["mods"].get(mod_name)
-        if entry is None:
-            raise StoreError(f'unknown mod "{mod_name}"')
         usable_game = (
             game if game is not None and game.install_dir is not None else None
         )
+        self._ensure_migrated(appid, manifest, usable_game, strict=True)
+        entry = manifest["mods"].get(mod_name)
+        if entry is None:
+            raise StoreError(f'unknown mod "{mod_name}"')
         try:
             deploy = self._entry_deploy(mod_name, entry, usable_game) or []
         except StoreError:
