@@ -1,8 +1,13 @@
-"""Import pipeline: archive extraction, mod-file scanning, pak-set validation.
+"""Import pipeline: archive extraction and pak-set validation.
+
+`ingest_tree` is the single entry point: it unpacks an upload into the
+mod repository preserving its directory tree, with no extension
+filtering — deciding what each file means is the recipe engine's job.
 
 A "pak set" is the group of same-stem files an IoStore mod ships as
 (.pak/.utoc/.ucas). When a .utoc or .ucas is present, all three members
-must exist; a standalone .pak is a valid classic mod on its own.
+must exist; a standalone .pak is a valid classic mod on its own. That
+rule is exposed as `pak_set_errors` for recipes to apply as a validator.
 """
 
 from __future__ import annotations
@@ -58,17 +63,6 @@ def pak_set_errors(names) -> list[str]:
                     + ", ".join(sorted(missing))
                 )
     return errors
-
-
-def scan_mod_files(root: Path) -> tuple[list[Path], list[str]]:
-    files = sorted(
-        p
-        for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in MOD_FILE_EXTS
-    )
-    if not files:
-        return files, ["no .pak/.utoc/.ucas files found"]
-    return files, pak_set_errors(files)
 
 
 def _verify_extraction_tree(dest: Path) -> None:
@@ -155,69 +149,6 @@ def extract_archive(archive: Path, dest: Path) -> None:
         _verify_extraction_tree(dest)
     else:
         raise ImportProblem(f"unsupported format: {suffix or archive.name}")
-
-
-def _collect(path: Path, workdir: Path) -> tuple[list[Path], list[str]]:
-    """Extract or accept `path`, returning (mod files, validation errors)."""
-    if not path.is_file():
-        raise ImportProblem(f"file not found: {path.name}")
-    suffix = path.suffix.lower()
-    if suffix in MOD_FILE_EXTS:
-        return scan_mod_files_for_single(path)
-    if suffix in ARCHIVE_EXTS:
-        extract_archive(path, workdir)
-        return scan_mod_files(workdir)
-    raise ImportProblem(f"unsupported format: {suffix or path.name}")
-
-
-def scan_mod_files_for_single(path: Path) -> tuple[list[Path], list[str]]:
-    if path.suffix.lower() == ".pak":
-        return [path], []
-    return [path], [
-        f"{path.stem}: a bare {path.suffix} needs its matching pak set "
-        "— upload the archive instead"
-    ]
-
-
-def inspect_upload(path: Path) -> tuple[str, str]:
-    # Contract: this classifier never raises. It runs once per inbox entry, so
-    # any escaping exception would blank the whole inbox listing instead of
-    # marking one bad upload. Archive libraries reach well past ImportProblem
-    # and OSError (zipfile alone raises RuntimeError for an encrypted member
-    # and NotImplementedError for an unknown compression method), so every
-    # exception becomes a per-entry error string.
-    try:
-        with _scratch_dir("moddock-inspect-") as tmp:
-            files, errors = _collect(path, Path(tmp))
-    except Exception as exc:  # noqa: BLE001 - classifier must not raise
-        return "error", str(exc)
-    if errors:
-        return "error", "; ".join(errors)
-    return "ready", f"{len(files)} mod file(s)"
-
-
-def ingest(path: Path, dest: Path) -> list[str]:
-    # Contract: every failure surfaces as ImportProblem, so filesystem errors
-    # (missing file, ENOSPC, EACCES) are wrapped rather than leaked.
-    try:
-        with _scratch_dir("moddock-ingest-") as tmp:
-            files, errors = _collect(path, Path(tmp))
-            if errors:
-                raise ImportProblem("; ".join(errors))
-            names = [f.name for f in files]
-            if len(set(names)) != len(names):
-                raise ImportProblem("archive contains duplicate mod file names")
-            dest.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                shutil.copy2(f, dest / f.name)
-    except OSError as exc:
-        raise ImportProblem(str(exc)) from exc
-    except (RuntimeError, NotImplementedError) as exc:
-        # Belt and braces: extract_archive already wraps what zipfile throws,
-        # but any other archive backend must not break the "all failures are
-        # ImportProblem" contract callers (ModStore) rely on.
-        raise ImportProblem(str(exc)) from exc
-    return sorted(names)
 
 
 def _strip_wrappers(root: Path) -> Path:

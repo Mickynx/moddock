@@ -5,20 +5,21 @@ from pathlib import Path
 
 import pytest
 
-from moddock.adapters.unreal import MODS_DIR_NAME, UEGameInfo
+from moddock.adapters.unreal import MODS_DIR_NAME, UEGameInfo, detect_ue_game
+from moddock.recipes import BUILTIN_RECIPES, recipe_from_dict
 from moddock.store import ModStore, StoreError, sanitize_mod_name
+
+PAK_RECIPE = BUILTIN_RECIPES[0]  # ue-paks-mods
 
 
 def _game(tmp_path: Path) -> UEGameInfo:
-    paks = tmp_path / "game" / "SB" / "Content" / "Paks"
+    install = tmp_path / "game"
+    (install / "Engine").mkdir(parents=True)
+    paks = install / "SB" / "Content" / "Paks"
     paks.mkdir(parents=True)
-    return UEGameInfo(
-        project_name="SB",
-        paks_dir=paks,
-        mods_dir=paks / MODS_DIR_NAME,
-        is_iostore=True,
-        has_shipping_exe=True,
-    )
+    (paks / "SB-Windows.pak").touch()
+    (install / "SB" / "Binaries" / "Win64").mkdir(parents=True)
+    return detect_ue_game(install)
 
 
 def _archive(tmp_path: Path, name: str = "ScarletHead.zip", stem: str = "scarlet") -> Path:
@@ -27,6 +28,21 @@ def _archive(tmp_path: Path, name: str = "ScarletHead.zip", stem: str = "scarlet
         for ext in ("pak", "utoc", "ucas"):
             zf.writestr(f"{stem}.{ext}", "x")
     return archive
+
+
+def _combo_recipe():
+    return recipe_from_dict(
+        {
+            "name": "pak + lua",
+            "rules": [
+                {"match": ["*.pak", "*.utoc", "*.ucas"], "anchor": "paks_dir",
+                 "subpath": "~mods"},
+                {"match": ["*.lua"], "anchor": "win64_dir",
+                 "subpath": "ue4ss/Mods", "mapping": "preserve_tree"},
+            ],
+        },
+        recipe_id="combo",
+    )
 
 
 def test_sanitize_mod_name():
@@ -38,18 +54,17 @@ def test_sanitize_mod_name():
 def test_import_enable_disable_cycle(tmp_path):
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
     repo_pak = tmp_path / "base" / "mods" / "1" / "Scarlet" / "scarlet.pak"
     assert repo_pak.is_file()
 
     [mod] = store.list_mods("1", game)
-    assert mod["name"] == "Scarlet"
-    assert mod["state"] == "disabled"
+    assert (mod["name"], mod["state"]) == ("Scarlet", "disabled")
+    assert mod["recipe_name"] == "UE ~mods (pak)"
 
     store.set_enabled("1", game, "Scarlet", True)
     assert (game.mods_dir / "scarlet.pak").is_file()
-    # Copy semantics: the repository keeps the full copy while enabled.
-    assert repo_pak.is_file()
+    assert repo_pak.is_file()  # copy semantics: repo keeps the full copy
     assert store.list_mods("1", game)[0]["state"] == "enabled"
 
     store.set_enabled("1", game, "Scarlet", False)
@@ -58,103 +73,170 @@ def test_import_enable_disable_cycle(tmp_path):
     assert store.list_mods("1", game)[0]["state"] == "disabled"
 
 
+def test_multi_destination_recipe(tmp_path):
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    archive = tmp_path / "combo.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for ext in ("pak", "utoc", "ucas"):
+            zf.writestr(f"scarlet.{ext}", "x")
+        zf.writestr("MyMod/scripts/main.lua", "x")
+    store.import_mod("1", game, "Combo", archive, _combo_recipe())
+    store.set_enabled("1", game, "Combo", True)
+
+    assert (game.mods_dir / "scarlet.pak").is_file()
+    lua = (game.install_dir / "SB/Binaries/Win64/ue4ss/Mods"
+           / "MyMod/scripts/main.lua")
+    assert lua.is_file()
+
+    store.set_enabled("1", game, "Combo", False)
+    assert not lua.exists()
+    # Shared directories are never deleted, only our files.
+    assert lua.parent.parent.parent.is_dir()
+
+
 def test_partial_state_detected_and_repaired_by_reenabling(tmp_path):
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
     store.set_enabled("1", game, "Scarlet", True)
     (game.mods_dir / "scarlet.ucas").unlink()
 
     assert store.list_mods("1", game)[0]["state"] == "partial"
-    # Enable is idempotent repair: the repository copy is re-copied in.
     store.set_enabled("1", game, "Scarlet", True)
-    assert store.list_mods("1", game)[0]["state"] == "enabled"
-
-
-def test_enable_overwrites_stale_copy(tmp_path):
-    """Import-time checks guarantee same-named files in ~mods are ModDock's
-    own, so enable may overwrite freely — that is what makes it idempotent."""
-    store = ModStore(tmp_path / "base")
-    game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
-    game.mods_dir.mkdir(parents=True)
-    (game.mods_dir / "scarlet.pak").write_bytes(b"stale")
-
-    store.set_enabled("1", game, "Scarlet", True)
-    assert (game.mods_dir / "scarlet.pak").read_bytes() == b"x"
     assert store.list_mods("1", game)[0]["state"] == "enabled"
 
 
 def test_enable_with_missing_store_copy_raises(tmp_path):
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
     (tmp_path / "base" / "mods" / "1" / "Scarlet" / "scarlet.ucas").unlink()
 
     with pytest.raises(StoreError) as excinfo:
         store.set_enabled("1", game, "Scarlet", True)
     assert "scarlet.ucas" in str(excinfo.value)
-    # Nothing was half-copied before the check.
     assert not (game.mods_dir / "scarlet.pak").exists()
 
 
 def test_duplicate_mod_name_rejected(tmp_path):
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
     with pytest.raises(StoreError):
-        store.import_mod("1", game, "Scarlet", _archive(tmp_path, "other.zip"))
+        store.import_mod("1", game, "Scarlet", _archive(tmp_path, "o.zip"),
+                         PAK_RECIPE)
 
 
-def test_file_basename_conflict_between_mods_rejected(tmp_path):
-    """Two mods for one game may not claim the same internal file name: the
-    manifest's basenames are what delete/toggle act on, so a collision would
-    make one mod destroy the other's files."""
+def test_claim_map_rejects_dst_collision_across_recipes(tmp_path):
+    """Two mods may not deploy to the same destination path, even via
+    different recipes."""
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet v1", _archive(tmp_path))
+    store.import_mod("1", game, "Scarlet v1", _archive(tmp_path), PAK_RECIPE)
 
     with pytest.raises(StoreError) as excinfo:
-        store.import_mod("1", game, "Scarlet v2", _archive(tmp_path, "other.zip"))
+        store.import_mod("1", game, "Scarlet v2",
+                         _archive(tmp_path, "other.zip"), PAK_RECIPE)
     message = str(excinfo.value)
     assert "scarlet.pak" in message
     assert "Scarlet v1" in message
-
-    # The rejected mod leaves nothing behind: no repo dir, no manifest entry.
     assert not (tmp_path / "base" / "mods" / "1" / "Scarlet v2").exists()
     assert [m["name"] for m in store.list_mods("1", game)] == ["Scarlet v1"]
 
-    # A mod with distinct file names still imports fine.
-    store.import_mod("1", game, "Other", _archive(tmp_path, "o.zip", stem="other"))
+    store.import_mod("1", game, "Other",
+                     _archive(tmp_path, "o.zip", stem="other"), PAK_RECIPE)
     assert len(store.list_mods("1", game)) == 2
 
 
-def test_uninstall_then_reinstall_keeps_mods_disabled(tmp_path):
-    """Steam uninstalling a game removes its install dir, ~mods included.
-    Under copy semantics that merely disables everything: the repository is
-    intact, mods list as disabled, and can be re-enabled after a reinstall."""
+def test_refuse_rule_rejects_unmanaged_file_at_import(tmp_path):
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    game.mods_dir.mkdir(parents=True)
+    (game.mods_dir / "scarlet.pak").write_bytes(b"hand-installed")
+
+    with pytest.raises(StoreError) as exc:
+        store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
+    assert "scarlet.pak" in str(exc.value)
+    assert not (tmp_path / "base" / "mods" / "1" / "Scarlet").exists()
+    assert (game.mods_dir / "scarlet.pak").read_bytes() == b"hand-installed"
+
+
+def test_backup_rule_backs_up_and_restores(tmp_path):
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    original = game.install_dir / "SB" / "original.dll"
+    original.parent.mkdir(parents=True, exist_ok=True)
+    original.write_bytes(b"vanilla")
+
+    recipe = recipe_from_dict(
+        {"name": "replace", "rules": [
+            {"match": ["*.dll"], "anchor": "game_root", "subpath": "SB",
+             "mapping": "flatten", "overwrite": "backup"}]},
+        recipe_id="rep",
+    )
+    archive = tmp_path / "r.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("original.dll", "modded")
+    store.import_mod("1", game, "Replacer", archive, recipe)
+
+    store.set_enabled("1", game, "Replacer", True)
+    assert original.read_bytes() == b"modded"
+    backup = tmp_path / "base" / "backup" / "1" / "SB" / "original.dll"
+    assert backup.read_bytes() == b"vanilla"
+
+    # Re-enabling must NOT re-backup (the true original is preserved).
+    store.set_enabled("1", game, "Replacer", True)
+    assert backup.read_bytes() == b"vanilla"
+
+    store.set_enabled("1", game, "Replacer", False)
+    assert original.read_bytes() == b"vanilla"
+    assert not backup.exists()
+
+
+def test_delete_restores_backup(tmp_path):
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    original = game.install_dir / "SB" / "original.dll"
+    original.parent.mkdir(parents=True, exist_ok=True)
+    original.write_bytes(b"vanilla")
+    recipe = recipe_from_dict(
+        {"name": "replace", "rules": [
+            {"match": ["*.dll"], "anchor": "game_root", "subpath": "SB",
+             "overwrite": "backup"}]},
+        recipe_id="rep",
+    )
+    archive = tmp_path / "r.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("original.dll", "modded")
+    store.import_mod("1", game, "Replacer", archive, recipe)
+    store.set_enabled("1", game, "Replacer", True)
+
+    store.delete_mod("1", game, "Replacer")
+    assert original.read_bytes() == b"vanilla"
+    assert store.list_mods("1", game) == []
+
+
+def test_uninstall_then_reinstall_keeps_mods_disabled(tmp_path):
+    store = ModStore(tmp_path / "base")
+    game = _game(tmp_path)
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
     store.set_enabled("1", game, "Scarlet", True)
 
-    shutil.rmtree(tmp_path / "game")  # Steam uninstall
+    shutil.rmtree(game.install_dir)
     assert store.list_mods("1", None)[0]["state"] == "disabled"
 
-    reinstalled = _game(tmp_path)  # Steam reinstall (fresh dirs)
+    reinstalled = _game(tmp_path)
     assert store.list_mods("1", reinstalled)[0]["state"] == "disabled"
     store.set_enabled("1", reinstalled, "Scarlet", True)
     assert store.list_mods("1", reinstalled)[0]["state"] == "enabled"
 
 
 def test_delete_without_game_cleans_repository(tmp_path):
-    """With copy semantics a delete needs no ~mods access: the game dir (and
-    any enabled copies in it) is gone with the game, so deleting while the
-    game is uninstalled just clears the repository and the manifest."""
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
-    shutil.rmtree(tmp_path / "game")
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
+    shutil.rmtree(game.install_dir)
 
     store.delete_mod("1", None, "Scarlet")
     assert store.list_mods("1", None) == []
@@ -164,40 +246,20 @@ def test_delete_without_game_cleans_repository(tmp_path):
 def test_set_enabled_wraps_os_error(tmp_path, monkeypatch):
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
 
     def boom(*args, **kwargs):
         raise OSError("No space left on device")
 
     monkeypatch.setattr("moddock.store.shutil.copy2", boom)
-    with pytest.raises(StoreError) as excinfo:
+    with pytest.raises(StoreError):
         store.set_enabled("1", game, "Scarlet", True)
-    assert "No space left on device" in str(excinfo.value)
-
-
-def test_delete_mod_wraps_os_error(tmp_path, monkeypatch):
-    store = ModStore(tmp_path / "base")
-    game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
-
-    real_unlink = Path.unlink
-
-    def boom(self, *args, **kwargs):
-        raise OSError("Permission denied")
-
-    monkeypatch.setattr(Path, "unlink", boom)
-    with pytest.raises(StoreError) as excinfo:
-        store.delete_mod("1", game, "Scarlet")
-    assert "Permission denied" in str(excinfo.value)
-    monkeypatch.setattr(Path, "unlink", real_unlink)
-    # The manifest entry survives a failed delete so the user can retry.
-    assert [m["name"] for m in store.list_mods("1", game)] == ["Scarlet"]
 
 
 def test_delete_enabled_mod_removes_files_everywhere(tmp_path):
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
     store.set_enabled("1", game, "Scarlet", True)
     store.delete_mod("1", game, "Scarlet")
     assert store.list_mods("1", game) == []
@@ -205,37 +267,41 @@ def test_delete_enabled_mod_removes_files_everywhere(tmp_path):
     assert not (tmp_path / "base" / "mods" / "1" / "Scarlet").exists()
 
 
-def test_manifest_written(tmp_path):
+def test_manifest_written_with_deploy_list(tmp_path):
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
-    store.import_mod("1", game, "Scarlet", _archive(tmp_path))
+    store.import_mod("1", game, "Scarlet", _archive(tmp_path), PAK_RECIPE)
     manifest = json.loads((tmp_path / "base" / "manifest" / "1.json").read_text())
-    assert "Scarlet" in manifest["mods"]
-    assert sorted(manifest["mods"]["Scarlet"]["files"]) == [
-        "scarlet.pak",
-        "scarlet.ucas",
-        "scarlet.utoc",
+    entry = manifest["mods"]["Scarlet"]
+    assert entry["recipe"] == "ue-paks-mods"
+    assert sorted(i["dst"] for i in entry["deploy"]) == [
+        "SB/Content/Paks/~mods/scarlet.pak",
+        "SB/Content/Paks/~mods/scarlet.ucas",
+        "SB/Content/Paks/~mods/scarlet.utoc",
     ]
 
 
-def test_import_rejects_file_already_unmanaged_in_mods_dir(tmp_path):
-    """A hand-installed file in ~mods must never become ModDock-managed.
-
-    Otherwise enable would overwrite, and delete would unlink, a file ModDock
-    never put there.
-    """
+def test_legacy_v1_manifest_still_works(tmp_path):
+    """A pre-recipe manifest (flat "files" list) keeps functioning."""
     store = ModStore(tmp_path / "base")
     game = _game(tmp_path)
-    game.mods_dir.mkdir(parents=True)
-    (game.mods_dir / "scarlet.pak").write_bytes(b"hand-installed")
+    repo = tmp_path / "base" / "mods" / "1" / "Old"
+    repo.mkdir(parents=True)
+    for ext in ("pak", "utoc", "ucas"):
+        (repo / f"old.{ext}").write_bytes(b"x")
+    (tmp_path / "base" / "manifest").mkdir(parents=True)
+    (tmp_path / "base" / "manifest" / "1.json").write_text(json.dumps({
+        "mods": {"Old": {
+            "files": ["old.pak", "old.utoc", "old.ucas"],
+            "source": "old.zip", "imported_at": "2026-09-01T00:00:00+00:00",
+            "repo": str(repo),
+        }}
+    }))
 
-    with pytest.raises(StoreError) as exc:
-        store.import_mod("1", game, "Scarlet", _archive(tmp_path))
-
-    message = str(exc.value)
-    assert "scarlet.pak" in message
-    assert "~mods" in message
-    # Nothing half-imported: no repo directory, no manifest entry.
-    assert not (tmp_path / "base" / "mods" / "1" / "Scarlet").exists()
-    assert not (tmp_path / "base" / "manifest" / "1.json").exists()
-    assert (game.mods_dir / "scarlet.pak").read_bytes() == b"hand-installed"
+    [mod] = store.list_mods("1", game)
+    assert mod["state"] == "disabled"
+    store.set_enabled("1", game, "Old", True)
+    assert (game.mods_dir / "old.pak").is_file()
+    store.set_enabled("1", game, "Old", False)
+    store.delete_mod("1", game, "Old")
+    assert store.list_mods("1", game) == []

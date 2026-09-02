@@ -8,9 +8,9 @@ import pytest
 from moddock.importer import (
     ImportProblem,
     _verify_extraction_tree,
-    ingest,
-    inspect_upload,
-    scan_mod_files,
+    extract_archive,
+    ingest_tree,
+    pak_set_errors,
 )
 
 
@@ -28,119 +28,23 @@ def _make_zip(path: Path, *names: str) -> Path:
     return path
 
 
-def test_scan_complete_iostore_set(tmp_path):
-    _touch(tmp_path, "mod.pak", "mod.utoc", "mod.ucas")
-    files, errors = scan_mod_files(tmp_path)
-    assert [f.name for f in files] == ["mod.pak", "mod.ucas", "mod.utoc"]
-    assert errors == []
-
-
-def test_scan_standalone_pak_is_valid(tmp_path):
-    _touch(tmp_path, "legacy.pak")
-    files, errors = scan_mod_files(tmp_path)
-    assert errors == []
-
-
-def test_scan_missing_ucas_fails(tmp_path):
-    _touch(tmp_path, "mod.pak", "mod.utoc")
-    _, errors = scan_mod_files(tmp_path)
+def test_pak_set_errors_pure_helper():
+    assert pak_set_errors(["a/mod.pak", "a/mod.utoc", "a/mod.ucas"]) == []
+    assert pak_set_errors(["solo.pak"]) == []
+    errors = pak_set_errors(["mod.pak", "mod.utoc"])
     assert errors and ".ucas" in errors[0]
 
 
-def test_scan_nested_and_ignores_junk(tmp_path):
-    _touch(tmp_path, "sub/dir/mod.pak", "readme.txt", "preview.png")
-    files, errors = scan_mod_files(tmp_path)
-    assert [f.name for f in files] == ["mod.pak"]
-    assert errors == []
+def test_pak_set_errors_ignores_non_mod_files():
+    assert pak_set_errors(["readme.txt", "preview.png"]) == []
 
 
-def test_scan_no_mod_files(tmp_path):
-    _touch(tmp_path, "readme.txt")
-    _, errors = scan_mod_files(tmp_path)
-    assert errors
-
-
-def test_inspect_zip_ready(tmp_path):
-    archive = _make_zip(tmp_path / "CoolMod.zip", "mod.pak", "mod.utoc", "mod.ucas")
-    status, detail = inspect_upload(archive)
-    assert status == "ready"
-    assert "3" in detail  # mentions the file count
-
-
-def test_inspect_rar_unsupported(tmp_path):
+def test_extract_archive_rejects_unsupported_format(tmp_path):
     rar = tmp_path / "mod.rar"
     rar.write_bytes(b"Rar!")
-    status, reason = inspect_upload(rar)
-    assert status == "error"
-    assert "unsupported" in reason.lower()
-
-
-def test_inspect_bare_pak(tmp_path):
-    _touch(tmp_path, "single.pak")
-    status, _ = inspect_upload(tmp_path / "single.pak")
-    assert status == "ready"
-
-
-def test_inspect_zip_missing_member(tmp_path):
-    archive = _make_zip(tmp_path / "broken.zip", "mod.pak", "mod.utoc")
-    status, reason = inspect_upload(archive)
-    assert status == "error"
-    assert ".ucas" in reason
-
-
-def test_ingest_zip_flattens(tmp_path):
-    archive = _make_zip(
-        tmp_path / "CoolMod.zip", "nested/mod.pak", "nested/mod.utoc", "nested/mod.ucas"
-    )
-    dest = tmp_path / "store"
-    names = ingest(archive, dest)
-    assert sorted(names) == ["mod.pak", "mod.ucas", "mod.utoc"]
-    assert (dest / "mod.pak").is_file()
-
-
-def test_ingest_bare_file(tmp_path):
-    _touch(tmp_path, "single.pak")
-    dest = tmp_path / "store"
-    assert ingest(tmp_path / "single.pak", dest) == ["single.pak"]
-
-
-def test_ingest_duplicate_basenames_rejected(tmp_path):
-    archive = _make_zip(tmp_path / "dup.zip", "a/mod.pak", "b/mod.pak")
-    with pytest.raises(ImportProblem):
-        ingest(archive, tmp_path / "store")
-
-
-def test_ingest_zip_blocks_path_traversal(tmp_path):
-    archive = tmp_path / "evil.zip"
-    with zipfile.ZipFile(archive, "w") as zf:
-        zf.writestr("../evil.pak", "x")
-    with pytest.raises(ImportProblem):
-        ingest(archive, tmp_path / "store")
-
-
-def test_inspect_missing_file_reports_error(tmp_path):
-    status, reason = inspect_upload(tmp_path / "ghost.pak")
-    assert status == "error"
-    assert "not found" in reason.lower()
-
-
-def test_inspect_missing_archive_reports_error(tmp_path):
-    status, reason = inspect_upload(tmp_path / "ghost.zip")
-    assert status == "error"
-    assert "not found" in reason.lower()
-
-
-def test_ingest_missing_archive_raises_import_problem(tmp_path):
-    with pytest.raises(ImportProblem):
-        ingest(tmp_path / "ghost.zip", tmp_path / "store")
-
-
-def test_ingest_wraps_os_error_as_import_problem(tmp_path):
-    _touch(tmp_path, "single.pak")
-    dest = tmp_path / "store"
-    dest.write_bytes(b"a file where the store should be")
-    with pytest.raises(ImportProblem):
-        ingest(tmp_path / "single.pak", dest)
+    with pytest.raises(ImportProblem) as exc:
+        extract_archive(rar, tmp_path / "out")
+    assert "unsupported" in str(exc.value).lower()
 
 
 def test_verify_extraction_tree_accepts_plain_files(tmp_path):
@@ -192,35 +96,36 @@ def _make_encrypted_zip(path: Path, name: str = "secret.pak") -> Path:
     return path
 
 
-def test_inspect_encrypted_zip_reports_error(tmp_path):
-    """An encrypted member makes zipfile raise RuntimeError, not ImportProblem.
-
-    inspect_upload is a classifier and must never raise: a single bad upload
-    would otherwise take down the whole inbox listing.
-    """
+def test_ingest_tree_encrypted_zip_raises_import_problem(tmp_path):
     archive = _make_encrypted_zip(tmp_path / "locked.zip")
-    status, reason = inspect_upload(archive)
-    assert status == "error"
-    assert "encrypted" in reason.lower()
+    with pytest.raises(ImportProblem) as exc:
+        ingest_tree(archive, tmp_path / "repo")
+    assert "encrypted" in str(exc.value).lower()
 
 
-def test_inspect_unsupported_compression_reports_error(tmp_path, monkeypatch):
+def test_ingest_tree_unsupported_compression_raises(tmp_path, monkeypatch):
+    """An unknown compression method is a bad upload, not a bug.
+
+    zipfile signals it with NotImplementedError, which must still reach the
+    caller as ImportProblem.
+    """
     archive = _make_zip(tmp_path / "weird.zip", "mod.pak")
 
     def boom(self, *args, **kwargs):
         raise NotImplementedError("that compression method is not supported")
 
     monkeypatch.setattr(zipfile.ZipFile, "extractall", boom)
-    status, reason = inspect_upload(archive)
-    assert status == "error"
-    assert "not supported" in reason.lower()
-
-
-def test_ingest_encrypted_zip_raises_import_problem(tmp_path):
-    archive = _make_encrypted_zip(tmp_path / "locked.zip")
     with pytest.raises(ImportProblem) as exc:
-        ingest(archive, tmp_path / "store")
-    assert "encrypted" in str(exc.value).lower()
+        ingest_tree(archive, tmp_path / "repo")
+    assert "not supported" in str(exc.value).lower()
+
+
+def test_ingest_tree_blocks_path_traversal(tmp_path):
+    archive = tmp_path / "evil.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("../evil.pak", "x")
+    with pytest.raises(ImportProblem):
+        ingest_tree(archive, tmp_path / "repo")
 
 
 def test_zip_uncompressed_size_cap(tmp_path, monkeypatch):
@@ -229,7 +134,7 @@ def test_zip_uncompressed_size_cap(tmp_path, monkeypatch):
         zf.writestr("mod.pak", "x" * 4096)
     monkeypatch.setattr("moddock.importer.MAX_UNCOMPRESSED", 1024)
     with pytest.raises(ImportProblem) as exc:
-        ingest(archive, tmp_path / "store")
+        ingest_tree(archive, tmp_path / "repo")
     assert "uncompress" in str(exc.value).lower()
 
 
@@ -239,7 +144,7 @@ def test_temp_root_is_honoured(tmp_path, monkeypatch):
     root.mkdir()
     monkeypatch.setattr("moddock.importer.TEMP_ROOT", root)
     archive = _make_zip(tmp_path / "mod.zip", "mod.pak")
-    ingest(archive, tmp_path / "store")
+    ingest_tree(archive, tmp_path / "repo")
     # The directory is cleaned up, but it must have been created under TEMP_ROOT
     # -- verified by watching what tempfile was asked for.
     seen: list[str | None] = []
@@ -250,7 +155,7 @@ def test_temp_root_is_honoured(tmp_path, monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr("moddock.importer.tempfile.TemporaryDirectory", spy)
-    ingest(archive, tmp_path / "store2")
+    ingest_tree(archive, tmp_path / "repo2")
     assert seen == [str(root)]
 
 
@@ -267,22 +172,11 @@ def test_7z_extraction_timeout_is_reported(tmp_path, monkeypatch):
 
     monkeypatch.setattr("moddock.importer.subprocess.run", timeout)
     with pytest.raises(ImportProblem) as exc:
-        ingest(archive, tmp_path / "store")
+        ingest_tree(archive, tmp_path / "repo")
     assert "timed out" in str(exc.value).lower()
 
 
-def test_pak_set_errors_pure_helper():
-    from moddock.importer import pak_set_errors
-
-    assert pak_set_errors(["a/mod.pak", "a/mod.utoc", "a/mod.ucas"]) == []
-    assert pak_set_errors(["solo.pak"]) == []
-    errors = pak_set_errors(["mod.pak", "mod.utoc"])
-    assert errors and ".ucas" in errors[0]
-
-
 def test_ingest_tree_preserves_structure(tmp_path):
-    from moddock.importer import ingest_tree
-
     archive = tmp_path / "m.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("mod.pak", "x")
@@ -293,8 +187,6 @@ def test_ingest_tree_preserves_structure(tmp_path):
 
 
 def test_ingest_tree_strips_wrapper_dirs(tmp_path):
-    from moddock.importer import ingest_tree
-
     archive = tmp_path / "m.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("Wrapper/Inner/mod.pak", "x")
@@ -304,15 +196,17 @@ def test_ingest_tree_strips_wrapper_dirs(tmp_path):
 
 
 def test_ingest_tree_bare_file(tmp_path):
-    from moddock.importer import ingest_tree
-
     (tmp_path / "solo.pak").write_bytes(b"x")
     assert ingest_tree(tmp_path / "solo.pak", tmp_path / "repo") == ["solo.pak"]
 
 
-def test_ingest_tree_empty_archive_raises(tmp_path):
-    from moddock.importer import ImportProblem, ingest_tree
+def test_ingest_tree_missing_source_raises(tmp_path):
+    with pytest.raises(ImportProblem) as exc:
+        ingest_tree(tmp_path / "ghost.zip", tmp_path / "repo")
+    assert "not found" in str(exc.value).lower()
 
+
+def test_ingest_tree_empty_archive_raises(tmp_path):
     archive = tmp_path / "empty.zip"
     with zipfile.ZipFile(archive, "w"):
         pass
@@ -321,8 +215,6 @@ def test_ingest_tree_empty_archive_raises(tmp_path):
 
 
 def test_ingest_tree_wraps_os_errors(tmp_path, monkeypatch):
-    from moddock.importer import ImportProblem, ingest_tree
-
     archive = tmp_path / "m.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("mod.pak", "x")
@@ -333,3 +225,11 @@ def test_ingest_tree_wraps_os_errors(tmp_path, monkeypatch):
     monkeypatch.setattr("moddock.importer.shutil.copy2", boom)
     with pytest.raises(ImportProblem):
         ingest_tree(archive, tmp_path / "repo")
+
+
+def test_ingest_tree_wraps_os_error_when_dest_is_a_file(tmp_path):
+    (tmp_path / "solo.pak").write_bytes(b"x")
+    dest = tmp_path / "repo"
+    dest.write_bytes(b"a file where the repository should be")
+    with pytest.raises(ImportProblem):
+        ingest_tree(tmp_path / "solo.pak", dest)
