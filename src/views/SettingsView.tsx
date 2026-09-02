@@ -130,6 +130,15 @@ export function SettingsView({ onBack }: { onBack: () => void }) {
         )}
       </PanelSection>
       <PanelSection title="Install methods">
+        {/* The same error row as above, repeated here: with the uploader
+            running the QR code can push the first one off-screen, and a
+            failed delete has to be visible next to the control that
+            produced it. */}
+        {error && (
+          <PanelSectionRow>
+            <div style={{ color: "#ff6a6a" }}>{error}</div>
+          </PanelSectionRow>
+        )}
         {recipes.length === 0 && (
           <PanelSectionRow>
             <div>No install methods yet.</div>
